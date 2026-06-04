@@ -1,0 +1,13 @@
+# 忽略环境变量文件（极其重要，防止密钥泄露！）
+.env
+
+# 忽略 Python 缓存文件
+__pycache__/
+*.pyc
+
+# 忽略 AI 生成的临时文件
+temp_result.csv
+
+# 忽略虚拟环境（如果你建了的话）
+venv/
+.venv/
