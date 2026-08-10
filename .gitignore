@@ -8,6 +8,14 @@ __pycache__/
 # 忽略 AI 生成的临时文件
 temp_result.csv
 
+# Local encrypted workspace data
+.tuoming-data/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
 # 忽略虚拟环境（如果你建了的话）
 venv/
 .venv/
