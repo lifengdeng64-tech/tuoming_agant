@@ -9,8 +9,9 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from tuoming_agent.analysis.executor import AnalysisExecutionError, AnalysisExecutor
 from tuoming_agent.analysis.planner import SafeAnalysisPlanner
+from tuoming_agent.analysis.presentation import describe_plan
+from tuoming_agent.analysis.workflow import AnalysisWorkflowService, WorkflowSnapshot
 from tuoming_agent.config import AppConfig, ConfigurationError
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
 from tuoming_agent.security.dlp import SensitiveContentError
@@ -439,9 +440,31 @@ def _render_analysis_view(
                     st.query_params["view"] = "结果"
                     st.rerun()
 
+    workflow = None
+    snapshot = None
+    if config.analyst_api_key:
+        planner = SafeAnalysisPlanner(
+            config.analyst_api_key,
+            config.analyst_base_url,
+            config.analyst_model_name,
+            services.conversations.sanitizer,
+        )
+        workflow = AnalysisWorkflowService(
+            services.repository,
+            services.artifacts,
+            planner,
+            config.analysis_max_repair_attempts,
+        )
+        snapshot = workflow.latest_for_conversation(tenant_id, workspace_id, conversation_id)
+        if snapshot:
+            _render_workflow_card(
+                services, workflow, snapshot, tenant_id, workspace_id, conversation_id
+            )
+
+    waiting = bool(snapshot and snapshot.run["status"] == "awaiting_confirmation")
     prompt = st.chat_input(
         "输入清洗、合并或分析要求",
-        disabled=not config.analyst_api_key,
+        disabled=not config.analyst_api_key or waiting,
     )
     if not prompt:
         return
@@ -456,28 +479,23 @@ def _render_analysis_view(
             conversation_id,
             preferred_artifact_id=source_id,
         )
-        planner = SafeAnalysisPlanner(
-            config.analyst_api_key,
-            config.analyst_base_url,
-            config.analyst_model_name,
-            services.conversations.sanitizer,
-        )
-        with st.spinner("正在生成并执行安全分析计划"):
-            plan = planner.create_plan(safe_request, context)
-            if plan.input_artifact_id != source_id:
-                raise AnalysisExecutionError("分析计划未使用选定的主数据源，已在本地阻止。")
-            services.conversations.sanitizer.assert_safe(f"{plan.result_name}\n{plan.safe_summary}")
-            artifact = AnalysisExecutor(services.artifacts).execute(tenant_id, workspace_id, plan)
-            services.conversations.add_assistant_message(
+        if workflow is None:
+            raise ValueError("分析模型未配置。")
+        with st.spinner("正在生成安全分析计划"):
+            created = workflow.start(
                 tenant_id,
+                workspace_id,
                 conversation_id,
-                plan.safe_summary,
-                artifact.id,
+                source_id,
+                safe_request,
+                context,
             )
-        st.session_state[f"result-selected-{workspace_id}"] = artifact.id
-        _set_flash("success", f"分析完成，已生成制品 {artifact.id[:8]}。")
+        if created.run["status"] == "awaiting_confirmation":
+            _set_flash("success", "计划已生成，请预览并确认后再执行。")
+        elif created.run["status"] == "security_blocked":
+            _set_flash("error", "计划触发安全拒绝，已阻止且不会自动修复。")
         st.rerun()
-    except (SensitiveContentError, AnalysisExecutionError, ValueError) as exc:
+    except (SensitiveContentError, ValueError) as exc:
         st.error(str(exc))
     except Exception:
         services.repository.add_audit_event(
@@ -487,6 +505,136 @@ def _render_analysis_view(
             {"source_artifact_id": source_id},
         )
         st.error("分析服务暂时不可用，请检查模型配置后重试。")
+
+
+def _render_workflow_card(
+    services: ApplicationServices,
+    workflow: AnalysisWorkflowService,
+    snapshot: WorkflowSnapshot,
+    tenant_id: str,
+    workspace_id: str,
+    conversation_id: str,
+) -> None:
+    status_labels = {
+        "planning": "正在规划",
+        "awaiting_confirmation": "等待确认",
+        "executing": "正在执行",
+        "validating": "正在校验",
+        "repairing": "正在生成修复计划",
+        "repairable_error": "可修复错误",
+        "completed": "已完成",
+        "rejected": "已拒绝",
+        "security_blocked": "安全阻止",
+        "failed": "失败",
+    }
+    status = snapshot.run["status"]
+    with st.container(border=True):
+        st.subheader(
+            f"分析运行 · {status_labels.get(status, status)}",
+            help=f"运行 ID：{snapshot.run['id']}",
+        )
+        st.caption(
+            f"计划版本 {snapshot.current_plan.version if snapshot.plan_versions else '-'} · "
+            f"已修复 {snapshot.run['repair_count']}/{snapshot.run['max_repairs']} 次"
+        )
+
+        if snapshot.plan_versions:
+            for line in describe_plan(snapshot.current_plan.plan):
+                st.markdown(f"- {line}")
+            if snapshot.current_plan.reason == "repair" and snapshot.run["error_message"]:
+                st.warning(f"上次执行未通过：{snapshot.run['error_message']}")
+
+        if len(snapshot.plan_versions) > 1 or snapshot.attempts:
+            decision_labels = {
+                "pending": "待确认",
+                "confirmed": "已确认",
+                "rejected": "已拒绝",
+                "superseded": "已被新版替代",
+            }
+            with st.expander("查看计划与执行历史"):
+                for version in reversed(snapshot.plan_versions):
+                    st.markdown(
+                        f"**计划 V{version.version}** · "
+                        f"{decision_labels.get(version.decision, version.decision)} · "
+                        f"来源：{version.reason}"
+                    )
+                for attempt in reversed(snapshot.attempts):
+                    detail = f" · {attempt.error_message}" if attempt.error_message else ""
+                    st.caption(
+                        f"执行 #{attempt.attempt_number}（计划 V{attempt.plan_version}）"
+                        f"：{attempt.status}{detail}"
+                    )
+
+        if status == "awaiting_confirmation":
+            confirm_col, reject_col = st.columns(2)
+            if confirm_col.button(
+                "确认并执行",
+                type="primary",
+                key=f"confirm-run-{snapshot.run['id']}",
+                use_container_width=True,
+            ):
+                with st.spinner("正在本地执行并进行质量校验"):
+                    result = workflow.confirm(tenant_id, snapshot.run["id"])
+                if result.run["status"] == "completed":
+                    artifact_id = result.run["result_artifact_id"]
+                    services.conversations.add_assistant_message(
+                        tenant_id,
+                        conversation_id,
+                        result.current_plan.plan.safe_summary,
+                        artifact_id,
+                    )
+                    st.session_state[f"result-selected-{workspace_id}"] = artifact_id
+                    _set_flash("success", f"分析完成，已生成制品 {artifact_id[:8]}。")
+                elif result.run["status"] == "awaiting_confirmation":
+                    _set_flash("error", "执行未通过，已生成修复计划，请重新确认。")
+                elif result.run["status"] == "security_blocked":
+                    _set_flash("error", "安全校验拒绝：已停止，未执行自动修复。")
+                else:
+                    _set_flash("error", result.run["error_message"] or "分析执行失败。")
+                st.rerun()
+            if reject_col.button(
+                "拒绝计划",
+                key=f"reject-run-{snapshot.run['id']}",
+                use_container_width=True,
+            ):
+                workflow.reject(tenant_id, snapshot.run["id"])
+                _set_flash("success", "计划已拒绝，没有执行任何数据操作。")
+                st.rerun()
+
+            with st.form(f"revise-run-{snapshot.run['id']}"):
+                feedback = st.text_area(
+                    "修改意见", placeholder="例如：只保留最近 30 天，并按门店汇总"
+                )
+                submitted = st.form_submit_button("根据意见生成新版计划")
+            if submitted and feedback.strip():
+                safe_feedback = services.conversations.sanitizer.sanitize(
+                    tenant_id, feedback.strip()
+                )
+                context = services.conversations.build_safe_context(
+                    tenant_id,
+                    workspace_id,
+                    conversation_id,
+                    preferred_artifact_id=snapshot.run["source_artifact_id"],
+                )
+                with st.spinner("正在生成新版计划"):
+                    workflow.revise(
+                        tenant_id, snapshot.run["id"], safe_feedback, context
+                    )
+                _set_flash("success", "新版计划已生成，请再次确认。")
+                st.rerun()
+
+        elif status == "completed":
+            st.success(f"质量校验通过，制品 {snapshot.run['result_artifact_id'][:8]} 已保存。")
+            latest_attempt = snapshot.attempts[-1] if snapshot.attempts else None
+            if latest_attempt and latest_attempt.quality_report:
+                for warning in latest_attempt.quality_report.warnings:
+                    st.warning(warning.message)
+        elif status == "security_blocked":
+            st.error(f"安全拒绝（不会自动修复）：{snapshot.run['error_message']}")
+        elif status == "failed":
+            st.error(snapshot.run["error_message"] or "分析运行失败。")
+        elif status == "rejected":
+            st.info("计划已由用户拒绝，未执行。")
 
 
 def _render_results_view(

@@ -176,3 +176,4 @@ def create_services(config: AppConfig) -> ApplicationServices:
         artifacts=ArtifactService(repository, artifact_store),
         conversations=ConversationService(repository, sanitizer),
     )
+

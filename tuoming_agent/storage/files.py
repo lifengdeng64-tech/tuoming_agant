@@ -65,3 +65,4 @@ class ArtifactStore:
     @staticmethod
     def read_dataframe(path: str | Path) -> pd.DataFrame:
         return pd.read_parquet(path)
+

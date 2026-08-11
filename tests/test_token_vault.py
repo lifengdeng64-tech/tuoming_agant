@@ -78,3 +78,4 @@ def test_unmasking_only_uses_declared_lineage(services):
     restored = services.masking.unmask_dataframe("tenant-a", masked, lineage)
     assert restored.loc[0, "门店"] == "上海店"
     assert restored.loc[0, "备注"] == "STORE_V1_NOT_A_REAL_TOKEN"
+

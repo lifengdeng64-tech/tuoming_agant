@@ -143,3 +143,4 @@ class TokenVault:
     @staticmethod
     def _aad(tenant_id: str, domain: str, version: int, token: str) -> bytes:
         return f"{tenant_id}|{domain}|{version}|{token}".encode()
+

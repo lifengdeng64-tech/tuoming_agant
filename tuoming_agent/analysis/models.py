@@ -116,3 +116,4 @@ class AnalysisPlan(StrictModel):
     operations: list[Operation] = Field(min_length=1, max_length=50)
     result_name: str = Field(default="分析结果", min_length=1, max_length=120)
     safe_summary: str = Field(default="处理完成", max_length=1000)
+

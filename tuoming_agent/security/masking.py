@@ -69,3 +69,4 @@ class MaskingService:
     def _is_null(value: Any) -> bool:
         result = pd.isna(value)
         return bool(result) if not hasattr(result, "__len__") else False
+

@@ -57,3 +57,4 @@ def deserialize_value(payload: bytes) -> Any:
     if value_type == "date":
         return date.fromisoformat(value)
     return str(value)
+

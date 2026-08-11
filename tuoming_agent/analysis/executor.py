@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
 
-from tuoming_agent.analysis.expression import evaluate_expression
+from tuoming_agent.analysis.errors import SecurityPolicyViolation
+from tuoming_agent.analysis.expression import UnsafeExpressionError, evaluate_expression
 from tuoming_agent.analysis.models import (
     AnalysisPlan,
     CastOperation,
@@ -29,11 +31,35 @@ class AnalysisExecutionError(ValueError):
     """Raised for a valid plan that cannot be applied to the selected artifacts."""
 
 
+@dataclass(frozen=True)
+class AnalysisCandidate:
+    name: str
+    dataframe: pd.DataFrame
+    lineage: dict[str, ColumnLineage]
+    parent_ids: tuple[str, ...]
+
+
 class AnalysisExecutor:
     def __init__(self, artifact_service: ArtifactService):
         self.artifact_service = artifact_service
 
     def execute(self, tenant_id: str, workspace_id: str, plan: AnalysisPlan) -> ArtifactRecord:
+        try:
+            candidate = self.prepare(tenant_id, workspace_id, plan)
+        except SecurityPolicyViolation as exc:
+            # Keep the public legacy API compatible while the workflow uses the typed
+            # security error from prepare() to enforce the no-repair rule.
+            raise AnalysisExecutionError(str(exc)) from exc
+        return self.artifact_service.save_result(
+            tenant_id,
+            workspace_id,
+            candidate.name,
+            candidate.dataframe,
+            candidate.lineage,
+            candidate.parent_ids,
+        )
+
+    def prepare(self, tenant_id: str, workspace_id: str, plan: AnalysisPlan) -> AnalysisCandidate:
         source, dataframe = self.artifact_service.load(tenant_id, plan.input_artifact_id)
         self._assert_workspace(source, workspace_id)
         lineage = dict(source.lineage)
@@ -47,20 +73,20 @@ class AnalysisExecutor:
                 if new_parent and new_parent not in parent_ids:
                     parent_ids.append(new_parent)
                 dataframe = dataframe.reset_index(drop=True)
-        except AnalysisExecutionError:
+        except (AnalysisExecutionError, SecurityPolicyViolation):
             raise
+        except UnsafeExpressionError as exc:
+            raise SecurityPolicyViolation(str(exc)) from exc
         except Exception as exc:
             raise AnalysisExecutionError(
                 "The approved analysis plan could not be executed on this schema."
             ) from exc
 
-        return self.artifact_service.save_result(
-            tenant_id,
-            workspace_id,
-            plan.result_name,
-            dataframe,
-            lineage,
-            tuple(parent_ids),
+        return AnalysisCandidate(
+            name=plan.result_name,
+            dataframe=dataframe,
+            lineage=lineage,
+            parent_ids=tuple(parent_ids),
         )
 
     def _apply(
@@ -245,4 +271,4 @@ class AnalysisExecutor:
     @staticmethod
     def _assert_workspace(artifact: ArtifactRecord, workspace_id: str) -> None:
         if artifact.workspace_id != workspace_id:
-            raise AnalysisExecutionError("Artifact belongs to another workspace.")
+            raise SecurityPolicyViolation("Artifact belongs to another workspace.")

@@ -137,6 +137,56 @@ CREATE TABLE IF NOT EXISTS audit_events (
     details_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS analysis_runs (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+    conversation_id TEXT NOT NULL REFERENCES conversations(id),
+    source_artifact_id TEXT NOT NULL REFERENCES artifacts(id),
+    safe_request TEXT NOT NULL,
+    context_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    repair_count INTEGER NOT NULL DEFAULT 0,
+    max_repairs INTEGER NOT NULL,
+    result_artifact_id TEXT REFERENCES artifacts(id),
+    error_kind TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_runs_workspace
+    ON analysis_runs(tenant_id, workspace_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS analysis_plan_versions (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    run_id TEXT NOT NULL REFERENCES analysis_runs(id),
+    version INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    feedback TEXT,
+    plan_json TEXT NOT NULL,
+    decision TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    decided_at TEXT,
+    UNIQUE(run_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS analysis_attempts (
+    id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    run_id TEXT NOT NULL REFERENCES analysis_runs(id),
+    plan_version INTEGER NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    quality_json TEXT,
+    error_kind TEXT,
+    error_message TEXT,
+    result_artifact_id TEXT REFERENCES artifacts(id),
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(run_id, attempt_number)
+);
 """
 
 
@@ -671,6 +721,263 @@ class SQLiteRepository:
             }
             for row in rows
         ]
+
+    def create_analysis_run(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        conversation_id: str,
+        source_artifact_id: str,
+        safe_request: str,
+        context: dict[str, Any],
+        max_repairs: int,
+    ) -> dict[str, Any]:
+        self.get_workspace(tenant_id, workspace_id)
+        conversation = self.get_conversation(tenant_id, conversation_id)
+        artifact = self.get_artifact(tenant_id, source_artifact_id)
+        if conversation["workspace_id"] != workspace_id or artifact.workspace_id != workspace_id:
+            raise AuthorizationError("Analysis inputs must belong to the selected workspace.")
+        now = utc_now()
+        record = {
+            "id": str(uuid.uuid4()),
+            "tenant_id": tenant_id,
+            "workspace_id": workspace_id,
+            "conversation_id": conversation_id,
+            "source_artifact_id": source_artifact_id,
+            "safe_request": safe_request,
+            "context_json": json.dumps(context, ensure_ascii=False),
+            "status": "planning",
+            "repair_count": 0,
+            "max_repairs": max_repairs,
+            "result_artifact_id": None,
+            "error_kind": None,
+            "error_message": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO analysis_runs(
+                    id, tenant_id, workspace_id, conversation_id, source_artifact_id,
+                    safe_request, context_json, status, repair_count, max_repairs,
+                    result_artifact_id, error_kind, error_message, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(record.values()),
+            )
+        return self._analysis_run_from_record(record)
+
+    def get_analysis_run(self, tenant_id: str, run_id: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM analysis_runs WHERE id = ? AND tenant_id = ?",
+                (run_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                self._raise_scoped(connection, "analysis_runs", run_id, tenant_id)
+        return self._analysis_run_from_record(dict(row))
+
+    def list_analysis_runs(
+        self, tenant_id: str, workspace_id: str, conversation_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        self.get_workspace(tenant_id, workspace_id)
+        query = "SELECT * FROM analysis_runs WHERE tenant_id = ? AND workspace_id = ?"
+        params: list[Any] = [tenant_id, workspace_id]
+        if conversation_id:
+            query += " AND conversation_id = ?"
+            params.append(conversation_id)
+        query += " ORDER BY updated_at DESC"
+        with self._connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self._analysis_run_from_record(dict(row)) for row in rows]
+
+    def update_analysis_run(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        expected_status: str | tuple[str, ...] | None = None,
+        **changes: Any,
+    ) -> dict[str, Any]:
+        allowed = {
+            "status",
+            "repair_count",
+            "result_artifact_id",
+            "error_kind",
+            "error_message",
+        }
+        if not changes or set(changes) - allowed:
+            raise ValueError("Unsupported analysis run update.")
+        self.get_analysis_run(tenant_id, run_id)
+        assignments = [f"{name} = ?" for name in changes]
+        values = list(changes.values())
+        assignments.append("updated_at = ?")
+        values.append(utc_now())
+        query = f"UPDATE analysis_runs SET {', '.join(assignments)} WHERE id = ? AND tenant_id = ?"
+        values.extend([run_id, tenant_id])
+        if expected_status is not None:
+            statuses = (expected_status,) if isinstance(expected_status, str) else expected_status
+            query += f" AND status IN ({','.join('?' for _ in statuses)})"
+            values.extend(statuses)
+        with self._connect() as connection:
+            cursor = connection.execute(query, values)
+            if cursor.rowcount != 1:
+                raise ValueError("Analysis run state changed; refresh and try again.")
+        return self.get_analysis_run(tenant_id, run_id)
+
+    def create_analysis_plan_version(
+        self,
+        tenant_id: str,
+        run_id: str,
+        plan: dict[str, Any],
+        reason: str,
+        feedback: str | None = None,
+    ) -> dict[str, Any]:
+        self.get_analysis_run(tenant_id, run_id)
+        created_at = utc_now()
+        with self._connect() as connection:
+            version = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM analysis_plan_versions WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()[0]
+            record = {
+                "id": str(uuid.uuid4()),
+                "tenant_id": tenant_id,
+                "run_id": run_id,
+                "version": version,
+                "reason": reason,
+                "feedback": feedback,
+                "plan_json": json.dumps(plan, ensure_ascii=False, sort_keys=True),
+                "decision": "pending",
+                "created_at": created_at,
+                "decided_at": None,
+            }
+            connection.execute(
+                """INSERT INTO analysis_plan_versions(
+                    id, tenant_id, run_id, version, reason, feedback, plan_json,
+                    decision, created_at, decided_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(record.values()),
+            )
+        return self._analysis_plan_from_record(record)
+
+    def list_analysis_plan_versions(self, tenant_id: str, run_id: str) -> list[dict[str, Any]]:
+        self.get_analysis_run(tenant_id, run_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM analysis_plan_versions
+                WHERE tenant_id = ? AND run_id = ? ORDER BY version""",
+                (tenant_id, run_id),
+            ).fetchall()
+        return [self._analysis_plan_from_record(dict(row)) for row in rows]
+
+    def decide_analysis_plan_version(
+        self, tenant_id: str, run_id: str, version: int, decision: str
+    ) -> None:
+        if decision not in {"confirmed", "rejected", "superseded"}:
+            raise ValueError("Unsupported plan decision.")
+        self.get_analysis_run(tenant_id, run_id)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE analysis_plan_versions SET decision = ?, decided_at = ?
+                WHERE tenant_id = ? AND run_id = ? AND version = ? AND decision = 'pending'""",
+                (decision, utc_now(), tenant_id, run_id, version),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Plan version is no longer pending.")
+
+    def create_analysis_attempt(
+        self, tenant_id: str, run_id: str, plan_version: int
+    ) -> dict[str, Any]:
+        self.get_analysis_run(tenant_id, run_id)
+        created_at = utc_now()
+        with self._connect() as connection:
+            attempt_number = connection.execute(
+                """SELECT COALESCE(MAX(attempt_number), 0) + 1
+                FROM analysis_attempts WHERE run_id = ?""",
+                (run_id,),
+            ).fetchone()[0]
+            record = {
+                "id": str(uuid.uuid4()),
+                "tenant_id": tenant_id,
+                "run_id": run_id,
+                "plan_version": plan_version,
+                "attempt_number": attempt_number,
+                "status": "executing",
+                "quality_json": None,
+                "error_kind": None,
+                "error_message": None,
+                "result_artifact_id": None,
+                "created_at": created_at,
+                "completed_at": None,
+            }
+            connection.execute(
+                """INSERT INTO analysis_attempts(
+                    id, tenant_id, run_id, plan_version, attempt_number, status,
+                    quality_json, error_kind, error_message, result_artifact_id,
+                    created_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(record.values()),
+            )
+        return self._analysis_attempt_from_record(record)
+
+    def finish_analysis_attempt(
+        self,
+        tenant_id: str,
+        attempt_id: str,
+        *,
+        status: str,
+        quality: dict[str, Any] | None = None,
+        error_kind: str | None = None,
+        error_message: str | None = None,
+        result_artifact_id: str | None = None,
+    ) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """UPDATE analysis_attempts SET status = ?, quality_json = ?, error_kind = ?,
+                    error_message = ?, result_artifact_id = ?, completed_at = ?
+                WHERE id = ? AND tenant_id = ? AND status = 'executing'""",
+                (
+                    status,
+                    json.dumps(quality, ensure_ascii=False) if quality is not None else None,
+                    error_kind,
+                    error_message,
+                    result_artifact_id,
+                    utc_now(),
+                    attempt_id,
+                    tenant_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Analysis attempt is no longer active.")
+
+    def list_analysis_attempts(self, tenant_id: str, run_id: str) -> list[dict[str, Any]]:
+        self.get_analysis_run(tenant_id, run_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT * FROM analysis_attempts
+                WHERE tenant_id = ? AND run_id = ? ORDER BY attempt_number""",
+                (tenant_id, run_id),
+            ).fetchall()
+        return [self._analysis_attempt_from_record(dict(row)) for row in rows]
+
+    @staticmethod
+    def _analysis_run_from_record(record: dict[str, Any]) -> dict[str, Any]:
+        value = dict(record)
+        value["context"] = json.loads(value.pop("context_json"))
+        return value
+
+    @staticmethod
+    def _analysis_plan_from_record(record: dict[str, Any]) -> dict[str, Any]:
+        value = dict(record)
+        value["plan"] = json.loads(value.pop("plan_json"))
+        return value
+
+    @staticmethod
+    def _analysis_attempt_from_record(record: dict[str, Any]) -> dict[str, Any]:
+        value = dict(record)
+        raw_quality = value.pop("quality_json")
+        value["quality"] = json.loads(raw_quality) if raw_quality else None
+        return value
 
     @staticmethod
     def _workspace_from_row(row: sqlite3.Row) -> WorkspaceRecord:

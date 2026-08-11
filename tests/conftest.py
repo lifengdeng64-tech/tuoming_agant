@@ -26,3 +26,4 @@ def services(config: AppConfig) -> ApplicationServices:
 @pytest.fixture
 def workspace(services: ApplicationServices):
     return services.repository.create_workspace("tenant-a", "测试工作区")
+

@@ -34,6 +34,7 @@ class AppConfig:
     analyst_api_key: str | None = None
     analyst_base_url: str | None = None
     analyst_model_name: str = "deepseek-chat"
+    analysis_max_repair_attempts: int = 3
 
     @property
     def database_path(self) -> Path:
@@ -54,6 +55,16 @@ class AppConfig:
             raise ConfigurationError("MASKING_KEY_VERSION must be a positive integer.") from exc
         if key_version < 1:
             raise ConfigurationError("MASKING_KEY_VERSION must be a positive integer.")
+        try:
+            max_repairs = int(os.getenv("ANALYSIS_MAX_REPAIR_ATTEMPTS", "3"))
+        except ValueError as exc:
+            raise ConfigurationError(
+                "ANALYSIS_MAX_REPAIR_ATTEMPTS must be a non-negative integer."
+            ) from exc
+        if max_repairs < 0:
+            raise ConfigurationError(
+                "ANALYSIS_MAX_REPAIR_ATTEMPTS must be a non-negative integer."
+            )
 
         return cls(
             master_key=decode_master_key(encoded_key),
@@ -64,4 +75,5 @@ class AppConfig:
             analyst_api_key=os.getenv("ANALYST_API_KEY") or None,
             analyst_base_url=os.getenv("ANALYST_BASE_URL") or None,
             analyst_model_name=os.getenv("ANALYST_MODEL_NAME", "deepseek-chat"),
+            analysis_max_repair_attempts=max_repairs,
         )

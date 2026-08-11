@@ -53,3 +53,4 @@ def _read_excel(stem: str, content: bytes) -> list[ParsedTable]:
         ]
     except Exception as exc:
         raise UnsupportedFileError("Excel workbook could not be parsed.") from exc
+

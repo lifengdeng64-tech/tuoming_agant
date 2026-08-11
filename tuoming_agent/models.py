@@ -65,3 +65,4 @@ class MessageRecord:
     safe_content: str
     artifact_id: str | None
     created_at: str
+

@@ -24,3 +24,4 @@ def detect_sensitive_columns(dataframe: pd.DataFrame, sample_size: int = 200) ->
         if any(pattern.search(value) for value in values for pattern in PII_PATTERNS.values()):
             detected.add(column_name)
     return detected
+
