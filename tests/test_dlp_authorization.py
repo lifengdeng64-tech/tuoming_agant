@@ -38,6 +38,18 @@ def test_outbound_model_request_contains_no_plaintext_pii(services, workspace):
     assert "PHONE_V1_" in serialized
 
 
+def test_planner_rejects_sensitive_content_in_model_output(services):
+    sanitizer = PromptSanitizer(services.vault)
+    plan = AnalysisPlan(
+        input_artifact_id="artifact-id",
+        result_name="private@example.com",
+        operations=[{"action": "head", "rows": 5}],
+    )
+    planner = SafeAnalysisPlanner(None, None, "test", sanitizer, model=RecordingModel(plan))
+    with pytest.raises(SensitiveContentError):
+        planner.create_plan("safe request", {})
+
+
 def test_unknown_plaintext_pii_is_blocked(services):
     sanitizer = PromptSanitizer(services.vault)
     with pytest.raises(SensitiveContentError):
@@ -76,4 +88,3 @@ def test_tenant_cannot_read_or_restore_other_tenant_data(services, workspace):
         services.repository.get_artifact("tenant-b", artifact_id)
     with pytest.raises(RecordNotFoundError):
         services.vault.resolve("tenant-b", token)
-

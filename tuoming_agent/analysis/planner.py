@@ -53,5 +53,6 @@ class SafeAnalysisPlanner:
                 ("user", payload),
             ]
         )
-        return result if isinstance(result, AnalysisPlan) else AnalysisPlan.model_validate(result)
-
+        plan = result if isinstance(result, AnalysisPlan) else AnalysisPlan.model_validate(result)
+        self.sanitizer.assert_safe(f"{plan.result_name}\n{plan.safe_summary}")
+        return plan
