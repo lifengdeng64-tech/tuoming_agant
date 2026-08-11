@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from langchain_openai import ChatOpenAI
+
+from tuoming_agent.analysis.models import AnalysisPlan
+from tuoming_agent.security.dlp import PromptSanitizer
+
+PLANNER_SYSTEM_PROMPT = """You are a data-operation planner. Return only a structured AnalysisPlan.
+You never write or execute Python, SQL, shell commands, imports, filesystem calls, or network calls.
+Use only these approved actions: select, filter, sort, rename, cast, fillna, dropna,
+deduplicate, merge, groupby, derive, head, tail.
+Artifact data is already pseudonymized. Use exact artifact IDs and exact schema column names.
+For derive expressions, use only arithmetic and col('column name').
+Do not place personal data in result_name or safe_summary.
+"""
+
+
+class SafeAnalysisPlanner:
+    def __init__(
+        self,
+        api_key: str | None,
+        base_url: str | None,
+        model_name: str,
+        sanitizer: PromptSanitizer,
+        model: Any | None = None,
+    ):
+        if model is None:
+            if not api_key:
+                raise ValueError("An analyst API key is required for natural-language planning.")
+            chat_model = ChatOpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                model=model_name,
+                temperature=0,
+            )
+            model = chat_model.with_structured_output(AnalysisPlan)
+        self.model = model
+        self.sanitizer = sanitizer
+
+    def create_plan(self, safe_request: str, safe_context: dict[str, Any]) -> AnalysisPlan:
+        payload = json.dumps(
+            {"request": safe_request, "workspace_context": safe_context},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.sanitizer.assert_safe(payload)
+        result = self.model.invoke(
+            [
+                ("system", PLANNER_SYSTEM_PROMPT),
+                ("user", payload),
+            ]
+        )
+        return result if isinstance(result, AnalysisPlan) else AnalysisPlan.model_validate(result)
+
