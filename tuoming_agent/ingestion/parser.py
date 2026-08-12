@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
+from itertools import islice
 from pathlib import Path
 from typing import BinaryIO
 
+import openpyxl
 import pandas as pd
 
 
@@ -17,6 +20,51 @@ class ParsedTable:
     logical_name: str
     sheet_name: str | None
     dataframe: pd.DataFrame
+
+
+def iter_file_chunks(
+    filename: str, source: BinaryIO, chunk_rows: int = 50_000
+) -> Iterator[ParsedTable]:
+    if chunk_rows < 1:
+        raise ValueError("chunk_rows must be positive.")
+    suffix = Path(filename).suffix.lower()
+    stem = Path(filename).stem.strip() or "dataset"
+    if suffix == ".csv":
+        encoding = _detect_csv_encoding(source)
+        source.seek(0)
+        try:
+            for dataframe in pd.read_csv(source, encoding=encoding, chunksize=chunk_rows):
+                yield ParsedTable(stem, None, dataframe)
+        except pd.errors.ParserError as exc:
+            raise UnsupportedFileError("CSV structure could not be parsed.") from exc
+        return
+    if suffix in {".xlsx", ".xlsm"}:
+        try:
+            source.seek(0)
+            workbook = openpyxl.load_workbook(
+                source, read_only=True, data_only=True, keep_vba=False
+            )
+            try:
+                for worksheet in workbook.worksheets:
+                    rows = worksheet.iter_rows(values_only=True)
+                    header = next(rows, None)
+                    if header is None:
+                        continue
+                    columns = [str(value) if value is not None else "" for value in header]
+                    while batch := list(islice(rows, chunk_rows)):
+                        yield ParsedTable(
+                            f"{stem}::{worksheet.title}",
+                            worksheet.title,
+                            pd.DataFrame(batch, columns=columns),
+                        )
+            finally:
+                workbook.close()
+        except Exception as exc:
+            if isinstance(exc, UnsupportedFileError):
+                raise
+            raise UnsupportedFileError("Excel workbook could not be parsed.") from exc
+        return
+    raise UnsupportedFileError("Only CSV, XLSX and XLSM files are supported.")
 
 
 def parse_file(filename: str, content: bytes) -> list[ParsedTable]:
@@ -54,6 +102,18 @@ def _read_csv(content: bytes | BinaryIO, sample_rows: int | None = None) -> pd.D
         except pd.errors.ParserError as exc:
             raise UnsupportedFileError("CSV structure could not be parsed.") from exc
     raise UnsupportedFileError(f"CSV encoding is unsupported; attempted: {', '.join(errors)}")
+
+
+def _detect_csv_encoding(source: BinaryIO, sample_size: int = 64 * 1024) -> str:
+    source.seek(0)
+    sample = source.read(sample_size)
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5"):
+        try:
+            sample.decode(encoding)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    raise UnsupportedFileError("CSV encoding is unsupported.")
 
 
 def _read_excel(
