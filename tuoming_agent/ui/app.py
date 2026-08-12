@@ -13,6 +13,8 @@ from tuoming_agent.analysis.planner import SafeAnalysisPlanner
 from tuoming_agent.analysis.presentation import describe_plan
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService, WorkflowSnapshot
 from tuoming_agent.config import AppConfig, ConfigurationError
+from tuoming_agent.ingestion.limits import validate_upload_size
+from tuoming_agent.ingestion.parser import preview_file
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
 from tuoming_agent.security.dlp import SensitiveContentError
 from tuoming_agent.security.masking import ColumnPolicy
@@ -278,13 +280,14 @@ def _render_data_view(
     prepared: list[tuple[str, bytes, dict[str, dict[str, ColumnPolicy]]]] = []
 
     for uploaded in uploaded_files or []:
-        content = uploaded.getvalue()
-        file_key = hashlib.sha256(content).hexdigest()[:12]
         try:
-            tables = services.ingestion.preview(uploaded.name, content)
+            validate_upload_size(uploaded.name, uploaded.size)
+            tables = preview_file(uploaded.name, uploaded)
         except ValueError as exc:
             st.error(f"{uploaded.name}: {exc}")
             continue
+        content = uploaded.getvalue()
+        file_key = hashlib.sha256(content).hexdigest()[:12]
         file_policies: dict[str, dict[str, ColumnPolicy]] = {}
         with st.expander(
             f"{uploaded.name} · {_format_bytes(len(content))} · {len(tables)} 张表",
