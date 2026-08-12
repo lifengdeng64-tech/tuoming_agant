@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+import hashlib
+import os
+import weakref
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,18 +34,58 @@ SECONDARY_ARTIFACT_LIMIT = 50 * MIB
 
 
 @dataclass(frozen=True)
-class _SourceAuthorization:
+class _AuthorizedSourceMetadata:
     artifact_id: str
     relation_name: str
     path: Path
+    role: str
+    size_limit: int
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    sha256: str
 
 
-@dataclass(frozen=True)
 class AuthorizedSource:
-    artifact_id: str
-    relation_name: str
-    path: Path
-    _authorization: _SourceAuthorization = field(repr=False, compare=False)
+    """Opaque source capability minted only after repository authorization."""
+
+    __slots__ = ("_relation_name", "__weakref__")
+
+    def __new__(cls, *_args: Any, **_kwargs: Any) -> AuthorizedSource:
+        raise TypeError("AuthorizedSource capabilities are minted by DuckDBCompiler.")
+
+    @property
+    def relation_name(self) -> str:
+        return self._relation_name
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise TypeError("AuthorizedSource capabilities are immutable.")
+
+    def __reduce_ex__(self, _protocol: int) -> Any:
+        raise TypeError("AuthorizedSource capabilities cannot be serialized.")
+
+
+def _source_capabilities() -> tuple[Any, Any]:
+    registry: weakref.WeakKeyDictionary[AuthorizedSource, _AuthorizedSourceMetadata]
+    registry = weakref.WeakKeyDictionary()
+
+    def mint(metadata: _AuthorizedSourceMetadata) -> AuthorizedSource:
+        source = object.__new__(AuthorizedSource)
+        object.__setattr__(source, "_relation_name", metadata.relation_name)
+        registry[source] = metadata
+        return source
+
+    def resolve(source: AuthorizedSource) -> _AuthorizedSourceMetadata | None:
+        metadata = registry.get(source)
+        if metadata is None or source.relation_name != metadata.relation_name:
+            return None
+        return metadata
+
+    return mint, resolve
+
+
+_mint_source, authorized_source_metadata = _source_capabilities()
 
 
 @dataclass(frozen=True)
@@ -81,7 +124,7 @@ class DuckDBCompiler:
         )
         columns = self._schema_columns(primary)
         order_column = self._internal_order_column(columns)
-        source = self._authorize_source(primary)
+        source = self._authorize_source(primary, role="primary", size_limit=PRIMARY_ARTIFACT_LIMIT)
         state = _QueryState(
             sql=(
                 f"SELECT {self._column_list(columns)}, "
@@ -150,13 +193,18 @@ class DuckDBCompiler:
         column = self._quote(operation.column)
         operators = {
             "eq": "=",
-            "ne": "!=",
             "gt": ">",
             "gte": ">=",
             "lt": "<",
             "lte": "<=",
         }
-        if operation.operator in operators:
+        if operation.operator == "ne":
+            if operation.value is None:
+                predicate = "TRUE"
+            else:
+                value = self._bind(operation.value)
+                predicate = f"({column} != {value} OR {column} IS NULL)"
+        elif operation.operator in operators:
             predicate = f"{column} {operators[operation.operator]} {self._bind(operation.value)}"
         elif operation.operator == "contains":
             predicate = f"contains(CAST({column} AS VARCHAR), {self._bind(str(operation.value))})"
@@ -237,7 +285,9 @@ class DuckDBCompiler:
         }
         projections = [
             (
-                f"CAST({self._quote(name)} AS {types[operation.mapping[name]]}) "
+                f"CAST(trunc({self._quote(name)}) AS BIGINT) AS {self._quote(name)}"
+                if operation.mapping.get(name) == "int64"
+                else f"CAST({self._quote(name)} AS {types[operation.mapping[name]]}) "
                 f"AS {self._quote(name)}"
                 if name in operation.mapping
                 else self._quote(name)
@@ -310,7 +360,9 @@ class DuckDBCompiler:
         )
         right_columns = self._schema_columns(artifact)
         self._require_columns(right_columns, operation.right_on)
-        source = self._authorize_source(artifact)
+        source = self._authorize_source(
+            artifact, role="secondary", size_limit=SECONDARY_ARTIFACT_LIMIT
+        )
 
         overlap = (set(state.columns) & set(right_columns)) - set(operation.left_on)
         left_names = [
@@ -328,6 +380,7 @@ class DuckDBCompiler:
         ]
         columns = left_names + [output for _, output in right_entries]
         self._require_unique_output(columns)
+        order_column = self._output_order_column(state, columns)
 
         left_alias = self._quote("_left")
         right_alias = self._quote("_right")
@@ -341,11 +394,11 @@ class DuckDBCompiler:
         )
         ordering = f"{left_alias}.{self._quote(state.order_column)}"
         projections.append(
-            f"row_number() OVER (ORDER BY {ordering} NULLS LAST) AS "
-            f"{self._quote(state.order_column)}"
+            f"row_number() OVER (ORDER BY {ordering} NULLS LAST) AS {self._quote(order_column)}"
         )
         conditions = [
-            f"{left_alias}.{self._quote(left)} = {right_alias}.{self._quote(right)}"
+            f"{left_alias}.{self._quote(left)} IS NOT DISTINCT FROM "
+            f"{right_alias}.{self._quote(right)}"
             for left, right in zip(operation.left_on, operation.right_on, strict=True)
         ]
         joins = {
@@ -368,18 +421,24 @@ class DuckDBCompiler:
             columns,
             operation,
         )
-        return self._state(state, sql, columns, lineage)
+        return _QueryState(
+            sql=sql,
+            columns=columns,
+            lineage=lineage,
+            order_column=order_column,
+        )
 
     def _groupby(self, state: _QueryState, operation: GroupByOperation) -> _QueryState:
         referenced = operation.by + [item.column for item in operation.aggregations]
         self._require_columns(state.columns, referenced)
         columns = list(operation.by) + [item.output for item in operation.aggregations]
         self._require_unique_output(columns)
+        order_column = self._output_order_column(state, columns)
         aggregates: list[str] = []
         for item in operation.aggregations:
             column = self._quote(item.column)
             functions = {
-                "sum": f"sum({column})",
+                "sum": f"coalesce(sum({column}), 0)",
                 "mean": f"avg({column})",
                 "median": f"median({column})",
                 "min": f"min({column})",
@@ -405,11 +464,16 @@ class DuckDBCompiler:
         sql = (
             f"SELECT {self._column_list(columns)}, row_number() OVER (ORDER BY "
             f"{group_columns}) AS "
-            f"{self._quote(state.order_column)} FROM ({grouped}) AS {self._quote('_group')} "
+            f"{self._quote(order_column)} FROM ({grouped}) AS {self._quote('_group')} "
             f"ORDER BY {group_columns}"
         )
         lineage = {name: state.lineage[name] for name in operation.by if name in state.lineage}
-        return self._state(state, sql, columns, lineage)
+        return _QueryState(
+            sql=sql,
+            columns=columns,
+            lineage=lineage,
+            order_column=order_column,
+        )
 
     def _derive(self, state: _QueryState, operation: DeriveOperation) -> _QueryState:
         prior_parameter_count = len(self._parameters)
@@ -428,11 +492,20 @@ class DuckDBCompiler:
             self._require_unique_output(columns)
             projections = [self._quote(name) for name in state.columns]
             projections.append(f"{expression} AS {self._quote(operation.column)}")
-        projections.append(self._quote(state.order_column))
+        order_column = self._output_order_column(state, columns)
+        order_projection = self._quote(state.order_column)
+        if order_column != state.order_column:
+            order_projection += f" AS {self._quote(order_column)}"
+        projections.append(order_projection)
         sql = f"SELECT {', '.join(projections)} FROM ({state.sql}) AS {self._quote('_derive')}"
         lineage = dict(state.lineage)
         lineage.pop(operation.column, None)
-        return self._state(state, sql, columns, lineage)
+        return _QueryState(
+            sql=sql,
+            columns=columns,
+            lineage=lineage,
+            order_column=order_column,
+        )
 
     def _limit(self, state: _QueryState, rows: int, *, tail: bool) -> _QueryState:
         order = self._quote(state.order_column)
@@ -460,8 +533,6 @@ class DuckDBCompiler:
             ast.Sub: "-",
             ast.Mult: "*",
             ast.Div: "/",
-            ast.FloorDiv: "//",
-            ast.Mod: "%",
         }
 
         def compile_node(node: ast.AST) -> str:
@@ -474,6 +545,16 @@ class DuckDBCompiler:
                 left = compile_node(node.left)
                 right = compile_node(node.right)
                 return f"({left} {binary[type(node.op)]} {right})"
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.FloorDiv):
+                return f"floor({compile_node(node.left)} / {compile_node(node.right)})"
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+                dividend = compile_node(node.left)
+                quotient_dividend = compile_node(node.left)
+                quotient_divisor = compile_node(node.right)
+                multiplier = compile_node(node.right)
+                return (
+                    f"({dividend} - floor({quotient_dividend} / {quotient_divisor}) * {multiplier})"
+                )
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
                 return f"power({compile_node(node.left)}, {compile_node(node.right)})"
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd | ast.USub):
@@ -515,19 +596,37 @@ class DuckDBCompiler:
             raise ValueError(f"The {role} artifact must be {limit // MIB} MiB or smaller.")
         return artifact
 
-    def _authorize_source(self, artifact: ArtifactRecord) -> AuthorizedSource:
-        source = AuthorizedSource(
-            artifact_id=artifact.id,
-            relation_name=f"source_{len(self._sources)}",
-            path=artifact.path.resolve(strict=True),
-            _authorization=_SourceAuthorization(
+    def _authorize_source(
+        self, artifact: ArtifactRecord, *, role: str, size_limit: int
+    ) -> AuthorizedSource:
+        path = artifact.path.resolve(strict=True)
+        fingerprint = self._fingerprint(path)
+        relation_name = f"source_{len(self._sources)}"
+        source = _mint_source(
+            _AuthorizedSourceMetadata(
                 artifact_id=artifact.id,
-                relation_name=f"source_{len(self._sources)}",
-                path=artifact.path.resolve(strict=True),
+                relation_name=relation_name,
+                path=path,
+                role=role,
+                size_limit=size_limit,
+                device=fingerprint.st_dev,
+                inode=fingerprint.st_ino,
+                size=fingerprint.st_size,
+                modified_ns=fingerprint.st_mtime_ns,
+                sha256=self._sha256(path),
             ),
         )
         self._sources.append(source)
         return source
+
+    @staticmethod
+    def _fingerprint(path: Path) -> os.stat_result:
+        return path.stat()
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
 
     @staticmethod
     def _schema_columns(artifact: ArtifactRecord) -> list[str]:
@@ -563,6 +662,11 @@ class DuckDBCompiler:
         while name in columns:
             name += "_"
         return name
+
+    def _output_order_column(self, state: _QueryState, columns: list[str]) -> str:
+        if state.order_column in columns:
+            return self._internal_order_column(columns)
+        return state.order_column
 
     def _select_stage(self, state: _QueryState, columns: list[str]) -> str:
         projection = [*(self._quote(name) for name in columns), self._quote(state.order_column)]
@@ -628,12 +732,3 @@ class DuckDBCompiler:
             ):
                 output[output_name] = right_lineage[name]
         return output
-
-
-def is_authorized_source(source: AuthorizedSource) -> bool:
-    authorization = source._authorization
-    return (
-        source.artifact_id == authorization.artifact_id
-        and source.relation_name == authorization.relation_name
-        and source.path == authorization.path
-    )

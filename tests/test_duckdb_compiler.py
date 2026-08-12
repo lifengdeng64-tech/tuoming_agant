@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import base64
+import os
+import pickle
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,7 +11,10 @@ import duckdb
 import pandas as pd
 import pytest
 
-from tuoming_agent.analysis.duckdb_compiler import DuckDBCompiler
+from tuoming_agent.analysis.duckdb_compiler import (
+    AuthorizedSource,
+    DuckDBCompiler,
+)
 from tuoming_agent.analysis.duckdb_runtime import DuckDBRuntime
 from tuoming_agent.analysis.errors import SecurityPolicyViolation
 from tuoming_agent.analysis.models import AnalysisPlan
@@ -211,7 +217,7 @@ def test_merge_executes_equality_join_and_tracks_authorized_source_lineage(
     ("operator", "value", "expected_values"),
     [
         ("eq", 3.0, [3.0]),
-        ("ne", 3.0, [1.0, 4.0]),
+        ("ne", 3.0, [1.0, None, 4.0]),
         ("gte", 3.0, [3.0, 4.0]),
         ("lt", 3.0, [1.0]),
         ("lte", 3.0, [1.0, 3.0]),
@@ -320,6 +326,185 @@ def test_nested_projection_parameters_match_sql_placeholder_order(
     assert actual == [(2.0,), (10.0,)]
 
 
+def test_null_merge_keys_match_and_all_null_aggregations_follow_pandas(services, config, workspace):
+    left = _artifact(
+        services,
+        workspace.id,
+        "nullable-left",
+        pd.DataFrame({"key": [None, "a"], "value": [None, None]}),
+    )
+    right = _artifact(
+        services,
+        workspace.id,
+        "nullable-right",
+        pd.DataFrame({"key": [None, "a"], "label": ["null-key", "a-key"]}),
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {
+            "input_artifact_id": left.id,
+            "operations": [
+                {
+                    "action": "merge",
+                    "right_artifact_id": right.id,
+                    "left_on": ["key"],
+                    "right_on": ["key"],
+                },
+                {
+                    "action": "groupby",
+                    "by": ["label"],
+                    "aggregations": [
+                        {"column": "value", "function": "sum", "output": "sum"},
+                        {"column": "value", "function": "mean", "output": "mean"},
+                        {"column": "value", "function": "median", "output": "median"},
+                        {"column": "value", "function": "min", "output": "min"},
+                        {"column": "value", "function": "max", "output": "max"},
+                        {"column": "value", "function": "count", "output": "count"},
+                        {"column": "value", "function": "nunique", "output": "nunique"},
+                        {"column": "value", "function": "first", "output": "first"},
+                        {"column": "value", "function": "last", "output": "last"},
+                    ],
+                },
+            ],
+        },
+    )
+    assert actual == [
+        ("a-key", 0.0, None, None, None, None, 0, 0, None, None),
+        ("null-key", 0.0, None, None, None, None, 0, 0, None, None),
+    ]
+
+
+def test_numeric_cast_floor_division_and_modulo_follow_pandas(services, config, workspace):
+    artifact = _artifact(
+        services,
+        workspace.id,
+        "numeric-edge-cases",
+        pd.DataFrame({"fraction": [1.9, -1.9], "numerator": [-3, 3]}),
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {
+            "input_artifact_id": artifact.id,
+            "operations": [
+                {"action": "cast", "mapping": {"fraction": "int64"}},
+                {
+                    "action": "derive",
+                    "column": "quotient",
+                    "expression": "col('numerator') // 2",
+                },
+                {
+                    "action": "derive",
+                    "column": "remainder",
+                    "expression": "col('numerator') % 2",
+                },
+                {"action": "select", "columns": ["fraction", "quotient", "remainder"]},
+            ],
+        },
+    )
+    assert actual == [(1, -2, 1), (-1, 1, 1)]
+
+
+def test_negative_divisors_and_ne_none_follow_pandas(services, config, workspace):
+    artifact = _artifact(
+        services,
+        workspace.id,
+        "negative-divisor",
+        pd.DataFrame({"value": [-3.0, None, 3.0]}),
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {
+            "input_artifact_id": artifact.id,
+            "operations": [
+                {"action": "filter", "column": "value", "operator": "ne", "value": None},
+                {
+                    "action": "derive",
+                    "column": "quotient",
+                    "expression": "col('value') // -2",
+                },
+                {
+                    "action": "derive",
+                    "column": "remainder",
+                    "expression": "col('value') % -2",
+                },
+                {"action": "select", "columns": ["value", "quotient", "remainder"]},
+            ],
+        },
+    )
+    assert actual == [(-3.0, 1.0, -1.0), (None, None, None), (3.0, -2.0, -1.0)]
+
+
+@pytest.mark.parametrize("producer", ["derive", "groupby", "merge"])
+def test_schema_producers_cannot_collide_with_private_row_order(
+    producer, services, config, workspace
+):
+    artifact = _artifact(
+        services,
+        workspace.id,
+        "private-name-left",
+        pd.DataFrame({"key": ["a", "b"], "value": [10, 20]}),
+    )
+    if producer == "derive":
+        operations = [
+            {
+                "action": "derive",
+                "column": "__tuoming_row_order",
+                "expression": "col('value') / 10",
+            },
+            {"action": "sort", "columns": ["value"], "ascending": False},
+        ]
+    elif producer == "groupby":
+        operations = [
+            {
+                "action": "groupby",
+                "by": ["key"],
+                "aggregations": [
+                    {
+                        "column": "value",
+                        "function": "sum",
+                        "output": "__tuoming_row_order",
+                    }
+                ],
+            },
+            {"action": "sort", "columns": ["__tuoming_row_order"], "ascending": False},
+        ]
+    else:
+        right = _artifact(
+            services,
+            workspace.id,
+            "private-name-right",
+            pd.DataFrame({"key": ["a", "b"], "__tuoming_row_order": [1, 2]}),
+        )
+        operations = [
+            {
+                "action": "merge",
+                "right_artifact_id": right.id,
+                "left_on": ["key"],
+                "right_on": ["key"],
+            },
+            {"action": "sort", "columns": ["__tuoming_row_order"], "ascending": False},
+        ]
+    operations.extend(
+        [
+            {"action": "head", "rows": 1},
+            {"action": "select", "columns": ["key"]},
+        ]
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {"input_artifact_id": artifact.id, "operations": operations},
+    )
+    assert actual == [("b",)]
+
+
 def test_missing_column_is_rejected_before_sql_execution(services, workspace, source):
     plan = AnalysisPlan(
         input_artifact_id=source.id,
@@ -399,9 +584,9 @@ def test_runtime_registers_only_trusted_sources_then_locks_external_access(
                       current_setting('enable_external_access'),
                       current_setting('lock_configuration')"""
         ).fetchone()
-        assert settings[0] == "1.8 GiB"
+        assert settings[0] == "2.0 GiB"
         assert settings[1] == 4
-        assert settings[2] == "3.7 GiB"
+        assert settings[2] == "4.0 GiB"
         assert Path(settings[3]).is_relative_to(config.data_dir)
         assert settings[4:] == (False, True)
         assert connection.execute(compiled.sql, compiled.parameters).fetchall() == [
@@ -420,9 +605,7 @@ def test_runtime_registers_only_trusted_sources_then_locks_external_access(
             connection.execute("SET enable_external_access=true")
 
 
-def test_runtime_rejects_a_compiler_source_whose_trusted_path_was_replaced(
-    services, config, workspace, source, tmp_path
-):
+def test_runtime_rejects_dataclass_replacement_of_trusted_source(services, workspace, source):
     compiled = DuckDBCompiler(services.repository).compile(
         "tenant-a",
         workspace.id,
@@ -431,12 +614,126 @@ def test_runtime_rejects_a_compiler_source_whose_trusted_path_was_replaced(
             operations=[{"action": "select", "columns": ["group"]}],
         ),
     )
-    untrusted = tmp_path / "untrusted.parquet"
-    pd.DataFrame({"secret": ["value"]}).to_parquet(untrusted)
-    tampered = replace(compiled.sources[0], path=untrusted)
+    with pytest.raises(TypeError):
+        replace(compiled.sources[0], relation_name="untrusted")
+
+
+def test_authorized_source_capability_cannot_be_constructed_copied_or_pickled(
+    services, workspace, source
+):
+    compiled = DuckDBCompiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
+    )
+    trusted = compiled.sources[0]
+    with pytest.raises(TypeError):
+        AuthorizedSource(source.id, "source_0", source.path)
+    forged = object.__new__(AuthorizedSource)
     with (
         pytest.raises(ValueError, match="authorized by the compiler"),
-        DuckDBRuntime(config).connection((tampered,)),
+        DuckDBRuntime(
+            config=AppConfig(
+                master_key=b"test-master-key-material-32-bytes!",
+                key_version=1,
+                data_dir=source.path.parent,
+                default_tenant="tenant-a",
+            )
+        ).connection((forged,)),
+    ):
+        pass
+    with pytest.raises(TypeError):
+        replace(trusted, path=source.path)
+    with pytest.raises(TypeError):
+        pickle.dumps(trusted)
+
+
+def test_runtime_rejects_source_replaced_after_compile(services, config, workspace, source):
+    compiled = DuckDBCompiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
+    )
+    replacement = source.path.with_name("replacement.parquet")
+    pd.DataFrame(
+        {"group": ["evil"], "value": [999.0], "text": ["evil"], "flag": [False]}
+    ).to_parquet(replacement, index=False)
+    os.replace(replacement, source.path)
+    with (
+        pytest.raises(SecurityPolicyViolation, match="changed after compilation"),
+        DuckDBRuntime(config).connection(compiled.sources),
+    ):
+        pass
+
+
+def test_registered_source_keeps_stable_file_identity(services, config, workspace, source):
+    compiled = DuckDBCompiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(
+            input_artifact_id=source.id,
+            operations=[{"action": "select", "columns": ["group"]}],
+        ),
+    )
+    replacement = source.path.with_name("replacement-after-registration.parquet")
+    pd.DataFrame(
+        {"group": ["evil"], "value": [999.0], "text": ["evil"], "flag": [False]}
+    ).to_parquet(replacement, index=False)
+    with DuckDBRuntime(config).connection(compiled.sources) as connection:
+        with suppress(PermissionError):
+            os.replace(replacement, source.path)
+        assert connection.execute(compiled.sql, compiled.parameters).fetchall() == [
+            ("a",),
+            ("a",),
+            ("b",),
+            ("b",),
+        ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("duckdb_memory_limit", "3GiB"),
+        ("duckdb_threads", 5),
+        ("duckdb_max_temp_directory_size", "5GiB"),
+    ],
+)
+def test_runtime_rejects_direct_config_values_above_resource_caps(
+    field, value, services, config, workspace, source
+):
+    compiled = DuckDBCompiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
+    )
+    unsafe = replace(config, **{field: value})
+    with (
+        pytest.raises(ConfigurationError),
+        DuckDBRuntime(unsafe).connection(compiled.sources),
+    ):
+        pass
+
+
+def test_runtime_rejects_resolved_temp_directory_outside_data_dir(
+    services, config, workspace, source, tmp_path
+):
+    class EscapingDataDirectory:
+        def __fspath__(self):
+            return str(config.data_dir)
+
+        def __truediv__(self, _child):
+            return tmp_path / "outside" / "duckdb-temp"
+
+    compiled = DuckDBCompiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
+    )
+    with (
+        pytest.raises(ConfigurationError, match="temp directory"),
+        DuckDBRuntime(replace(config, data_dir=EscapingDataDirectory())).connection(
+            compiled.sources
+        ),
     ):
         pass
 

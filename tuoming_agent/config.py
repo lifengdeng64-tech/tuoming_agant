@@ -36,9 +36,9 @@ class AppConfig:
     analyst_base_url: str | None = None
     analyst_model_name: str = "deepseek-chat"
     analysis_max_repair_attempts: int = 3
-    duckdb_memory_limit: str = "2GB"
+    duckdb_memory_limit: str = "2GiB"
     duckdb_threads: int = 4
-    duckdb_max_temp_directory_size: str = "4GB"
+    duckdb_max_temp_directory_size: str = "4GiB"
 
     @property
     def database_path(self) -> Path:
@@ -68,11 +68,11 @@ class AppConfig:
         if max_repairs < 0:
             raise ConfigurationError("ANALYSIS_MAX_REPAIR_ATTEMPTS must be a non-negative integer.")
         duckdb_memory_limit = _validated_duckdb_size(
-            "DUCKDB_MEMORY_LIMIT", os.getenv("DUCKDB_MEMORY_LIMIT", "2GB"), 2 * 1024**3
+            "DUCKDB_MEMORY_LIMIT", os.getenv("DUCKDB_MEMORY_LIMIT", "2GiB"), 2 * 1024**3
         )
         duckdb_max_temp_directory_size = _validated_duckdb_size(
             "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
-            os.getenv("DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "4GB"),
+            os.getenv("DUCKDB_MAX_TEMP_DIRECTORY_SIZE", "4GiB"),
             4 * 1024**3,
         )
         try:
@@ -115,3 +115,14 @@ def _validated_duckdb_size(name: str, value: str, maximum_bytes: int) -> str:
     if int(match.group(1)) * multipliers[match.group(2)] > maximum_bytes:
         raise ConfigurationError(f"{name} exceeds its safe limit.")
     return value
+
+
+def validate_duckdb_settings(config: AppConfig) -> None:
+    _validated_duckdb_size("DUCKDB_MEMORY_LIMIT", config.duckdb_memory_limit, 2 * 1024**3)
+    _validated_duckdb_size(
+        "DUCKDB_MAX_TEMP_DIRECTORY_SIZE",
+        config.duckdb_max_temp_directory_size,
+        4 * 1024**3,
+    )
+    if not isinstance(config.duckdb_threads, int) or not 1 <= config.duckdb_threads <= 4:
+        raise ConfigurationError("DUCKDB_THREADS must be an integer from 1 to 4.")
