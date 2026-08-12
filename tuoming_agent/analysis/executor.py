@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+import duckdb
 import pandas as pd
 
+from tuoming_agent.analysis.duckdb_runtime import DuckDBRuntime
 from tuoming_agent.analysis.errors import SecurityPolicyViolation
 from tuoming_agent.analysis.expression import UnsafeExpressionError, evaluate_expression
 from tuoming_agent.analysis.models import (
@@ -31,12 +34,25 @@ class AnalysisExecutionError(ValueError):
     """Raised for a valid plan that cannot be applied to the selected artifacts."""
 
 
+class AnalysisResourceError(RuntimeError):
+    """Raised when bounded DuckDB execution exhausts configured resources."""
+
+
 @dataclass(frozen=True)
 class AnalysisCandidate:
     name: str
-    dataframe: pd.DataFrame
+    dataframe: pd.DataFrame | None
     lineage: dict[str, ColumnLineage]
     parent_ids: tuple[str, ...]
+    path: Path | None = None
+    schema: dict[str, Any] | None = None
+    row_count: int | None = None
+    owns_path: bool = False
+    input_row_count: int | None = None
+
+    def cleanup(self) -> None:
+        if self.owns_path and self.path is not None:
+            self.path.unlink(missing_ok=True)
 
 
 class AnalysisExecutor:
@@ -45,7 +61,7 @@ class AnalysisExecutor:
 
     def execute(self, tenant_id: str, workspace_id: str, plan: AnalysisPlan) -> ArtifactRecord:
         try:
-            candidate = self.prepare(tenant_id, workspace_id, plan)
+            candidate = self._prepare_dataframe(tenant_id, workspace_id, plan)
         except SecurityPolicyViolation as exc:
             # Keep the public legacy API compatible while the workflow uses the typed
             # security error from prepare() to enforce the no-repair rule.
@@ -60,6 +76,94 @@ class AnalysisExecutor:
         )
 
     def prepare(self, tenant_id: str, workspace_id: str, plan: AnalysisPlan) -> AnalysisCandidate:
+        runtime = DuckDBRuntime(self.artifact_service.config)
+        candidate_path: Path | None = None
+        try:
+            compiled = runtime.compiler(self.artifact_service.repository).compile(
+                tenant_id, workspace_id, plan
+            )
+            with runtime.connection(compiled.sources) as connection:
+                batches = connection.execute(
+                    compiled.sql, compiled.parameters
+                ).to_arrow_reader(batch_size=65_536)
+                try:
+                    candidate_path = self.artifact_service.artifact_store.write_record_batches(
+                        tenant_id, workspace_id, batches
+                    )
+                finally:
+                    batches.close()
+            schema, row_count = self.artifact_service.artifact_store.inspect_parquet(
+                candidate_path
+            )
+            return AnalysisCandidate(
+                name=plan.result_name,
+                dataframe=None,
+                path=candidate_path,
+                schema=schema,
+                row_count=row_count,
+                lineage=compiled.lineage,
+                parent_ids=self._parent_ids(plan),
+                owns_path=True,
+                input_row_count=self.artifact_service.repository.get_artifact(
+                    tenant_id, plan.input_artifact_id
+                ).row_count,
+            )
+        except (SecurityPolicyViolation, AnalysisExecutionError):
+            if candidate_path is not None:
+                candidate_path.unlink(missing_ok=True)
+            raise
+        except duckdb.Error as exc:
+            if candidate_path is not None:
+                candidate_path.unlink(missing_ok=True)
+            if self._is_resource_error(exc):
+                raise AnalysisResourceError(
+                    "DuckDB resource limit reached; reduce input size or simplify the plan."
+                ) from exc
+            raise AnalysisExecutionError(
+                "The approved analysis plan could not be executed on this schema."
+            ) from exc
+        except ValueError as exc:
+            if candidate_path is not None:
+                candidate_path.unlink(missing_ok=True)
+            if self._is_resource_error(exc):
+                raise AnalysisResourceError(
+                    "Authorized source size limit reached; reduce the input size."
+                ) from exc
+            raise AnalysisExecutionError(str(exc)) from exc
+        except Exception:
+            if candidate_path is not None:
+                candidate_path.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _is_resource_error(exc: Exception) -> bool:
+        message = str(exc).casefold()
+        return isinstance(exc, duckdb.OutOfMemoryException) or any(
+            marker in message
+            for marker in (
+                "memory limit",
+                "out of memory",
+                "maximum temp directory",
+                "no space left",
+                "over its authorized size limit",
+                "artifact must be",
+            )
+        )
+
+    @staticmethod
+    def _parent_ids(plan: AnalysisPlan) -> tuple[str, ...]:
+        parent_ids = [plan.input_artifact_id]
+        for operation in plan.operations:
+            if (
+                isinstance(operation, MergeOperation)
+                and operation.right_artifact_id not in parent_ids
+            ):
+                parent_ids.append(operation.right_artifact_id)
+        return tuple(parent_ids)
+
+    def _prepare_dataframe(
+        self, tenant_id: str, workspace_id: str, plan: AnalysisPlan
+    ) -> AnalysisCandidate:
         source, dataframe = self.artifact_service.load(tenant_id, plan.input_artifact_id)
         self._assert_workspace(source, workspace_id)
         lineage = dict(source.lineage)

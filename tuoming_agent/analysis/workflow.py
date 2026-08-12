@@ -217,6 +217,7 @@ class AnalysisWorkflowService:
             tenant_id, run_id, expected_status="awaiting_confirmation", status="executing"
         )
         attempt = self.repository.create_analysis_attempt(tenant_id, run_id, plan_version.version)
+        candidate = None
 
         try:
             self._assert_selected_source(plan_version.plan, snapshot.run)
@@ -239,13 +240,8 @@ class AnalysisWorkflowService:
                 )
                 return self._repair(tenant_id, run_id, message, plan_version.plan)
 
-            artifact = self.artifact_service.save_result(
-                tenant_id,
-                snapshot.run["workspace_id"],
-                candidate.name,
-                candidate.dataframe,
-                candidate.lineage,
-                candidate.parent_ids,
+            artifact = self.artifact_service.publish_candidate(
+                tenant_id, snapshot.run["workspace_id"], candidate
             )
             self.repository.finish_analysis_attempt(
                 tenant_id,
@@ -304,6 +300,9 @@ class AnalysisWorkflowService:
                 error_kind="terminal",
                 error_message=str(exc),
             )
+        finally:
+            if candidate is not None:
+                candidate.cleanup()
         return self.get_snapshot(tenant_id, run_id)
 
     def _repair(

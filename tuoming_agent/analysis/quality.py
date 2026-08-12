@@ -5,6 +5,9 @@ from io import BytesIO
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 from tuoming_agent.analysis.executor import AnalysisCandidate
 
@@ -45,10 +48,27 @@ class QualityReport:
 
 
 class AnalysisQualityValidator:
-    def __init__(self, large_result_rows: int = 1_000_000):
+    def __init__(
+        self,
+        large_result_rows: int = 1_000_000,
+        max_row_amplification: float = 100.0,
+    ):
         self.large_result_rows = large_result_rows
+        self.max_row_amplification = max_row_amplification
 
     def validate(self, candidate: AnalysisCandidate) -> QualityReport:
+        if candidate.path is not None:
+            return self._validate_parquet(candidate)
+        if candidate.dataframe is None:
+            return QualityReport(
+                False,
+                failures=(
+                    QualityIssue("serialization_failed", "Result data is unavailable."),
+                ),
+            )
+        return self._validate_dataframe(candidate)
+
+    def _validate_dataframe(self, candidate: AnalysisCandidate) -> QualityReport:
         frame = candidate.dataframe
         failures: list[QualityIssue] = []
         warnings: list[QualityIssue] = []
@@ -86,3 +106,58 @@ class AnalysisQualityValidator:
 
         return QualityReport(not failures, tuple(failures), tuple(warnings))
 
+    def _validate_parquet(self, candidate: AnalysisCandidate) -> QualityReport:
+        failures: list[QualityIssue] = []
+        warnings: list[QualityIssue] = []
+        columns = [
+            str(item.get("name", ""))
+            for item in (candidate.schema or {}).get("columns", [])
+            if isinstance(item, dict)
+        ]
+
+        if any(not column.strip() for column in columns):
+            failures.append(QualityIssue("blank_columns", "输出包含空列名。"))
+        if len(columns) != len(set(columns)):
+            failures.append(QualityIssue("duplicate_columns", "输出列名不唯一。"))
+        invalid_lineage = sorted(set(candidate.lineage) - set(columns))
+        if invalid_lineage:
+            failures.append(QualityIssue("invalid_lineage", "字段血缘引用了不存在的输出列。"))
+
+        row_count = candidate.row_count or 0
+        null_count = 0
+        has_infinite = False
+        try:
+            parquet = pq.ParquetFile(candidate.path)
+            if parquet.metadata.num_rows != row_count:
+                raise ValueError("row count mismatch")
+            if parquet.schema_arrow.names != columns:
+                raise ValueError("schema mismatch")
+            for batch in parquet.iter_batches(batch_size=65_536):
+                null_count += sum(column.null_count for column in batch.columns)
+                for index, field in enumerate(batch.schema):
+                    if pa.types.is_floating(field.type):
+                        finite = pc.is_finite(batch.column(index))
+                        if pc.any(pc.invert(pc.fill_null(finite, True))).as_py():
+                            has_infinite = True
+            if has_infinite:
+                failures.append(QualityIssue("infinite_values", "数值结果包含正负无穷。"))
+        except Exception:
+            failures.append(QualityIssue("serialization_failed", "结果无法可靠序列化并读回。"))
+
+        cell_count = row_count * len(columns)
+        null_ratio = null_count / cell_count if cell_count else 0.0
+        if row_count == 0:
+            warnings.append(QualityIssue("empty_result", "结果为空，请确认筛选条件。"))
+        elif null_ratio > 0:
+            warnings.append(QualityIssue("null_values", "结果中仍包含空值。"))
+        if row_count > self.large_result_rows:
+            warnings.append(QualityIssue("large_result", "输出数据量较大。"))
+        if (
+            candidate.input_row_count
+            and row_count / candidate.input_row_count > self.max_row_amplification
+        ):
+            warnings.append(
+                QualityIssue("row_amplification", "输出行数相对输入显著放大。")
+            )
+
+        return QualityReport(not failures, tuple(failures), tuple(warnings))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from tuoming_agent.analysis.executor import AnalysisResourceError
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.quality import QualityIssue, QualityReport
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService
@@ -72,7 +73,7 @@ def test_confirm_executes_validates_and_persists_result(services, workspace):
 
     finished = workflow.confirm("tenant-a", started.run["id"])
 
-    assert finished.run["status"] == "completed"
+    assert finished.run["status"] == "completed", finished.run["error_message"]
     assert finished.run["result_artifact_id"]
     assert finished.attempts[-1].quality_report.passed is True
     _, frame = services.artifacts.load("tenant-a", finished.run["result_artifact_id"])
@@ -188,6 +189,9 @@ def test_quality_failure_repairs_before_any_candidate_is_saved(services, workspa
     assert repaired.attempts[-1].quality_report.passed is False
     assert repaired.attempts[-1].error_kind == "repairable"
     assert len(services.repository.list_artifacts("tenant-a", workspace.id)) == 1
+    assert not list(
+        (services.artifacts.artifact_store.root / "analysis-candidates").rglob("*.parquet")
+    )
 
 
 def test_unexpected_execution_error_is_terminal_and_does_not_repair(
@@ -207,5 +211,55 @@ def test_unexpected_execution_error_is_terminal_and_does_not_repair(
 
     assert failed.run["status"] == "failed"
     assert failed.run["error_kind"] == "terminal"
+    assert failed.attempts[-1].error_kind == "terminal"
+    assert len(planner.calls) == 1
+
+
+def test_workflow_publishes_disk_candidate_only_after_quality_success(
+    services, workspace, monkeypatch
+):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    workflow = AnalysisWorkflowService(
+        services.repository, services.artifacts, QueuePlanner([_plan(source.id)])
+    )
+    started = workflow.start("tenant-a", workspace.id, conversation["id"], source.id, "x", {})
+
+    def reject_dataframe_save(*_args, **_kwargs):
+        raise AssertionError("production workflow must publish the disk candidate")
+
+    monkeypatch.setattr(services.artifacts, "save_result", reject_dataframe_save)
+    finished = workflow.confirm("tenant-a", started.run["id"])
+
+    assert finished.run["status"] == "completed", finished.run["error_message"]
+    result = services.repository.get_artifact(
+        "tenant-a", finished.run["result_artifact_id"]
+    )
+    assert result.path.is_file()
+    assert not list(
+        (services.artifacts.artifact_store.root / "analysis-candidates").rglob("*.parquet")
+    )
+
+
+def test_resource_limit_error_is_actionable_terminal_and_never_repaired(
+    services, workspace, monkeypatch
+):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    planner = QueuePlanner([_plan(source.id), _plan(source.id, "store")])
+    workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
+    started = workflow.start("tenant-a", workspace.id, conversation["id"], source.id, "x", {})
+
+    def exhaust_memory(*_args, **_kwargs):
+        raise AnalysisResourceError(
+            "DuckDB resource limit reached; reduce input size or simplify the plan."
+        )
+
+    monkeypatch.setattr(workflow.executor, "prepare", exhaust_memory)
+    failed = workflow.confirm("tenant-a", started.run["id"])
+
+    assert failed.run["status"] == "failed"
+    assert failed.run["error_kind"] == "terminal"
+    assert "reduce input size" in failed.run["error_message"]
     assert failed.attempts[-1].error_kind == "terminal"
     assert len(planner.calls) == 1

@@ -145,6 +145,67 @@ class ArtifactStore:
                 temporary.unlink(missing_ok=True)
             raise
 
+    def write_record_batches(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        batches: pa.RecordBatchReader,
+    ) -> Path:
+        target_dir = self.root / "analysis-candidates" / tenant_id / workspace_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{uuid.uuid4()}.parquet"
+        temporary = target.with_suffix(f".{uuid.uuid4().hex}.tmp.parquet")
+        writer: pq.ParquetWriter | None = None
+        try:
+            writer = pq.ParquetWriter(temporary, batches.schema)
+            for batch in batches:
+                writer.write_batch(batch)
+            writer.close()
+            writer = None
+            os.replace(temporary, target)
+            return target
+        except Exception:
+            if writer is not None:
+                writer.close()
+            temporary.unlink(missing_ok=True)
+            target.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def inspect_parquet(path: str | Path) -> tuple[dict[str, object], int]:
+        parquet = pq.ParquetFile(path)
+        empty = parquet.schema_arrow.empty_table().to_pandas()
+        schema = {
+            "columns": [
+                {"name": str(column), "dtype": str(empty[column].dtype)}
+                for column in empty.columns
+            ]
+        }
+        return schema, parquet.metadata.num_rows
+
+    def publish_candidate(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        artifact_id: str,
+        candidate_path: str | Path,
+    ) -> Path:
+        source = Path(candidate_path)
+        candidate_dir = (
+            self.root / "analysis-candidates" / tenant_id / workspace_id
+        ).resolve()
+        if (
+            not source.is_file()
+            or source.suffix.lower() != ".parquet"
+            or source.resolve().parent != candidate_dir
+        ):
+            raise ValueError("Analysis candidate is not owned by this workspace.")
+        target_dir = self.root / "artifacts" / tenant_id / workspace_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{artifact_id}.parquet"
+        os.replace(source, target)
+        return target
+
     @staticmethod
     def read_dataframe(path: str | Path) -> pd.DataFrame:
         return pd.read_parquet(path)

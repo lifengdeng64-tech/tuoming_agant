@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -17,9 +18,15 @@ from tuoming_agent.storage.sqlite import SQLiteRepository
 
 
 class ArtifactService:
-    def __init__(self, repository: SQLiteRepository, artifact_store: ArtifactStore):
+    def __init__(
+        self,
+        repository: SQLiteRepository,
+        artifact_store: ArtifactStore,
+        config: AppConfig,
+    ):
         self.repository = repository
         self.artifact_store = artifact_store
+        self.config = config
 
     def load(self, tenant_id: str, artifact_id: str) -> tuple[ArtifactRecord, pd.DataFrame]:
         artifact = self.repository.get_artifact(tenant_id, artifact_id)
@@ -62,6 +69,66 @@ class ArtifactService:
             workspace_id,
             {"artifact_id": artifact.id, "row_count": len(dataframe)},
         )
+        return artifact
+
+    def publish_candidate(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        candidate: Any,
+    ) -> ArtifactRecord:
+        if (
+            candidate.path is None
+            or candidate.schema is None
+            or candidate.row_count is None
+            or not candidate.owns_path
+        ):
+            raise ValueError("Only an owned disk-backed candidate can be published.")
+        artifact_id = str(uuid.uuid4())
+        path = self.artifact_store.publish_candidate(
+            tenant_id, workspace_id, artifact_id, candidate.path
+        )
+        artifact = ArtifactRecord(
+            id=artifact_id,
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            kind="analysis_result",
+            name=candidate.name,
+            path=path,
+            row_count=candidate.row_count,
+            schema=candidate.schema,
+            lineage=candidate.lineage,
+            parent_ids=candidate.parent_ids,
+            created_at=utc_now(),
+        )
+        try:
+            with self.repository._connect() as connection:
+                self.repository._publish_artifact(connection, artifact)
+                cursor = connection.execute(
+                    "UPDATE workspaces SET updated_at = ? WHERE id = ? AND tenant_id = ?",
+                    (utc_now(), workspace_id, tenant_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("Workspace is not authorized for candidate publication.")
+                connection.execute(
+                    """INSERT INTO audit_events(
+                        id, tenant_id, workspace_id, event_type, details_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        str(uuid.uuid4()),
+                        tenant_id,
+                        workspace_id,
+                        "analysis_artifact_created",
+                        json.dumps(
+                            {"artifact_id": artifact.id, "row_count": artifact.row_count},
+                            ensure_ascii=True,
+                        ),
+                        utc_now(),
+                    ),
+                )
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
         return artifact
 
 
@@ -173,7 +240,6 @@ def create_services(config: AppConfig) -> ApplicationServices:
             SecureFileStore(config.data_dir, config.master_key),
             artifact_store,
         ),
-        artifacts=ArtifactService(repository, artifact_store),
+        artifacts=ArtifactService(repository, artifact_store, config),
         conversations=ConversationService(repository, sanitizer),
     )
-
