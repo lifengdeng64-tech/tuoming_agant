@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=43.0",
+    "duckdb>=1.4,<1.6",
     "langchain-openai>=0.2.14,<1",
     "openpyxl>=3.1",
     "pandas>=2.2",
@@ -42,4 +43,3 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-
