@@ -117,7 +117,8 @@ class AnalysisExecutor:
                 candidate_path.unlink(missing_ok=True)
             if self._is_resource_error(exc):
                 raise AnalysisResourceError(
-                    "DuckDB resource limit reached; reduce input size or simplify the plan."
+                    "DuckDB 内存或临时磁盘资源达到上限；请减小输入或简化计划后重试 "
+                    "(reduce input size or simplify the plan)."
                 ) from exc
             raise AnalysisExecutionError(
                 "The approved analysis plan could not be executed on this schema."
@@ -127,7 +128,8 @@ class AnalysisExecutor:
                 candidate_path.unlink(missing_ok=True)
             if self._is_resource_error(exc):
                 raise AnalysisResourceError(
-                    "Authorized source size limit reached; reduce the input size."
+                    "输入制品超过授权大小上限；请减小输入后重试 "
+                    "(reduce the input size)."
                 ) from exc
             raise AnalysisExecutionError(str(exc)) from exc
         except Exception:

@@ -44,6 +44,10 @@ class AppConfig:
     def database_path(self) -> Path:
         return self.data_dir / "tuoming.sqlite3"
 
+    @property
+    def duckdb_temp_reserve_bytes(self) -> int:
+        return _duckdb_size_bytes(self.duckdb_max_temp_directory_size)
+
     @classmethod
     def from_env(cls) -> AppConfig:
         load_dotenv()
@@ -115,6 +119,22 @@ def _validated_duckdb_size(name: str, value: str, maximum_bytes: int) -> str:
     if int(match.group(1)) * multipliers[match.group(2)] > maximum_bytes:
         raise ConfigurationError(f"{name} exceeds its safe limit.")
     return value
+
+
+def _duckdb_size_bytes(value: str) -> int:
+    match = re.fullmatch(r"([1-9][0-9]*)\s?(B|KB|MB|GB|KiB|MiB|GiB)", value.strip())
+    if match is None:
+        raise ConfigurationError("DuckDB byte size is invalid.")
+    multipliers = {
+        "B": 1,
+        "KB": 1000,
+        "MB": 1000**2,
+        "GB": 1000**3,
+        "KiB": 1024,
+        "MiB": 1024**2,
+        "GiB": 1024**3,
+    }
+    return int(match.group(1)) * multipliers[match.group(2)]
 
 
 def validate_duckdb_settings(config: AppConfig) -> None:

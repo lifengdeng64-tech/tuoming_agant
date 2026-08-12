@@ -11,6 +11,7 @@ from typing import Any, BinaryIO
 from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import ParsedTable, iter_file_chunks, parse_file
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
+from tuoming_agent.maintenance import ensure_disk_headroom
 from tuoming_agent.models import ArtifactRecord, utc_now
 from tuoming_agent.security.masking import ColumnPolicy, MaskingService
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
@@ -36,11 +37,13 @@ class IngestionService:
         masking_service: MaskingService,
         secure_file_store: SecureFileStore,
         artifact_store: ArtifactStore,
+        temp_reserve_bytes: int,
     ):
         self.repository = repository
         self.masking_service = masking_service
         self.secure_file_store = secure_file_store
         self.artifact_store = artifact_store
+        self.temp_reserve_bytes = temp_reserve_bytes
 
     def preview(self, filename: str, content: bytes) -> list[ParsedTable]:
         return parse_file(filename, content)
@@ -60,6 +63,11 @@ class IngestionService:
             source = content
         byte_size, content_hash = self._measure_and_hash(source)
         validate_upload_size(filename, byte_size)
+        ensure_disk_headroom(
+            self.artifact_store.root,
+            byte_size,
+            self.temp_reserve_bytes,
+        )
         duplicate = self.repository.find_file_by_hash(tenant_id, workspace_id, content_hash)
         if duplicate:
             versions = self.repository.get_file_versions(tenant_id, duplicate["id"])

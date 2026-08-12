@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import struct
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from threading import Barrier, Event, local
@@ -16,12 +18,19 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import iter_file_chunks, preview_file
 from tuoming_agent.ingestion.service import UnsafeIngestionError
+from tuoming_agent.maintenance import (
+    DiskHeadroomError,
+    MaintenanceError,
+    cleanup_stale_files,
+    ensure_disk_headroom,
+)
 from tuoming_agent.security.crypto import STREAM_MAGIC, derive_key
 from tuoming_agent.security.masking import ColumnPolicy
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
 from tuoming_agent.ui import app as ui_app
 
 MIB = 1024 * 1024
+GIB = 1024 * MIB
 
 
 class BoundedReadStream(BytesIO):
@@ -610,3 +619,192 @@ def test_ingestion_does_not_publish_metadata_when_chunked_parquet_write_fails(
 
     assert services.repository.list_files("tenant-a", workspace.id) == []
     assert services.repository.list_artifacts("tenant-a", workspace.id) == []
+
+
+def test_disk_headroom_requires_three_inputs_plus_temp_reserve(monkeypatch, tmp_path) -> None:
+    input_size = 7 * MIB
+    required = 3 * input_size + 4 * GIB
+    monkeypatch.setattr(
+        "tuoming_agent.maintenance.shutil.disk_usage",
+        lambda _path: shutil._ntuple_diskusage(total=required * 2, used=required, free=required),
+    )
+
+    ensure_disk_headroom(tmp_path, input_size, 4 * GIB)
+
+    monkeypatch.setattr(
+        "tuoming_agent.maintenance.shutil.disk_usage",
+        lambda _path: shutil._ntuple_diskusage(
+            total=required * 2, used=required + 1, free=required - 1
+        ),
+    )
+    with pytest.raises(DiskHeadroomError, match="磁盘可用空间不足"):
+        ensure_disk_headroom(tmp_path, input_size, 4 * GIB)
+
+
+def test_ingestion_rejects_low_disk_before_any_ingestion_write(
+    monkeypatch, services, workspace
+) -> None:
+    content = b"value\n1\n"
+    required = 3 * len(content) + 4 * GIB
+    monkeypatch.setattr(
+        "tuoming_agent.maintenance.shutil.disk_usage",
+        lambda _path: shutil._ntuple_diskusage(total=required, used=1, free=required - 1),
+    )
+    monkeypatch.setattr(
+        services.repository,
+        "find_file_by_hash",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("disk check must happen before repository lookup")
+        ),
+    )
+    with pytest.raises(DiskHeadroomError, match="清理空间或调小待上传文件"):
+        services.ingestion.ingest(
+            "tenant-a", workspace.id, "low-space.csv", content, {"low-space": {}}
+        )
+
+    assert services.repository.list_files("tenant-a", workspace.id) == []
+    assert services.repository.list_artifacts("tenant-a", workspace.id) == []
+    assert not (services.ingestion.secure_file_store.root / "uploads").exists()
+    assert not (services.ingestion.artifact_store.root / "artifacts").exists()
+
+
+def test_stale_cleanup_only_removes_owned_unreferenced_patterns(
+    services, workspace, config
+) -> None:
+    result = services.ingestion.ingest(
+        "tenant-a", workspace.id, "kept.csv", b"value\n1\n", {"kept": {}}
+    )
+    referenced_upload = Path(
+        services.repository.find_file_by_hash(
+            "tenant-a", workspace.id, result.content_hash
+        )["encrypted_path"]
+    )
+    referenced_artifact = result.artifacts[0].path
+    old = datetime(2026, 8, 10, tzinfo=UTC)
+    now = datetime(2026, 8, 12, tzinfo=UTC)
+
+    orphan_upload = (
+        config.data_dir
+        / "uploads"
+        / "tenant-a"
+        / workspace.id
+        / f"{'a' * 64}.{'b' * 32}.enc"
+    )
+    stale_upload_tmp = orphan_upload.parent / f".{'c' * 32}.tmp"
+    recent_upload_tmp = orphan_upload.parent / f".{'d' * 32}.tmp"
+    stale_artifact_tmp = (
+        config.data_dir
+        / "artifacts"
+        / "tenant-a"
+        / workspace.id
+        / f"artifact.{'e' * 32}.tmp.parquet"
+    )
+    stale_candidate = (
+        config.data_dir / "analysis-candidates" / "tenant-a" / workspace.id / "candidate.parquet"
+    )
+    stale_export = config.data_dir / "exports" / "masked-12345678-orphan.csv"
+    unknown = config.data_dir / "exports" / "notes.txt"
+    snapshot_dir = config.data_dir / "duckdb-temp" / "sources-abandoned"
+    stale_snapshot = snapshot_dir / f"0-{'f' * 32}.parquet"
+    paths = (
+        orphan_upload,
+        stale_upload_tmp,
+        recent_upload_tmp,
+        stale_artifact_tmp,
+        stale_candidate,
+        stale_export,
+        unknown,
+        stale_snapshot,
+    )
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"owned")
+    for path in (*paths[:2], *paths[3:], referenced_upload, referenced_artifact):
+        os.utime(path, (old.timestamp(), old.timestamp()))
+    os.utime(recent_upload_tmp, (now.timestamp(), now.timestamp()))
+
+    removed = cleanup_stale_files(config.data_dir, config.database_path, now=now)
+
+    assert set(removed) == {
+        orphan_upload,
+        stale_upload_tmp,
+        stale_artifact_tmp,
+        stale_candidate,
+        stale_export,
+        stale_snapshot,
+    }
+    assert recent_upload_tmp.exists()
+    assert unknown.exists()
+    assert referenced_upload.exists()
+    assert referenced_artifact.exists()
+    assert not snapshot_dir.exists()
+
+
+def test_stale_cleanup_fails_closed_when_sqlite_references_cannot_be_read(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    candidate = data_dir / "analysis-candidates" / "tenant" / "workspace" / "old.parquet"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"candidate")
+    old = datetime(2026, 8, 10, tzinfo=UTC).timestamp()
+    os.utime(candidate, (old, old))
+    database = data_dir / "tuoming.sqlite3"
+    database.write_bytes(b"not sqlite")
+
+    with pytest.raises(MaintenanceError, match="元数据"):
+        cleanup_stale_files(
+            data_dir,
+            database,
+            now=datetime(2026, 8, 12, tzinfo=UTC),
+        )
+
+    assert candidate.exists()
+
+
+def test_stale_cleanup_fails_closed_when_sqlite_metadata_is_missing(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    candidate = data_dir / "analysis-candidates" / "tenant" / "workspace" / "old.parquet"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"candidate")
+    old = datetime(2026, 8, 10, tzinfo=UTC).timestamp()
+    os.utime(candidate, (old, old))
+
+    with pytest.raises(MaintenanceError, match="元数据"):
+        cleanup_stale_files(
+            data_dir,
+            data_dir / "missing.sqlite3",
+            now=datetime(2026, 8, 12, tzinfo=UTC),
+        )
+
+    assert candidate.exists()
+
+
+def test_stale_cleanup_never_follows_directory_symlinks(tmp_path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    database = data_dir / "tuoming.sqlite3"
+    import sqlite3
+
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            "CREATE TABLE files(encrypted_path TEXT); CREATE TABLE artifacts(path TEXT);"
+        )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped = outside / "escaped.tmp.parquet"
+    escaped.write_bytes(b"must stay")
+    old = datetime(2026, 8, 10, tzinfo=UTC).timestamp()
+    os.utime(escaped, (old, old))
+    link = data_dir / "artifacts"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("当前 Windows 权限不允许创建目录符号链接")
+
+    removed = cleanup_stale_files(
+        data_dir,
+        database,
+        now=datetime(2026, 8, 12, tzinfo=UTC),
+    )
+
+    assert removed == []
+    assert escaped.exists()

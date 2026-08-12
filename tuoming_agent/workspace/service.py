@@ -295,6 +295,7 @@ def create_services(config: AppConfig) -> ApplicationServices:
             masking,
             SecureFileStore(config.data_dir, config.master_key),
             artifact_store,
+            config.duckdb_temp_reserve_bytes,
         ),
         artifacts=artifacts,
         conversations=ConversationService(repository, sanitizer),

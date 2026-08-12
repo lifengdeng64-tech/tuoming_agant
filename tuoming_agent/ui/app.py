@@ -17,6 +17,7 @@ from tuoming_agent.exporting import ExportLimitError
 from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import preview_file
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
+from tuoming_agent.maintenance import DiskHeadroomError
 from tuoming_agent.security.dlp import SensitiveContentError
 from tuoming_agent.security.masking import ColumnPolicy
 from tuoming_agent.ui.styles import APP_STYLES
@@ -354,7 +355,7 @@ def _render_data_view(
             duplicates = len(results) - added
             _set_flash("success", f"已追加 {added} 个文件，跳过 {duplicates} 个重复文件。")
             st.rerun()
-        except ValueError as exc:
+        except (DiskHeadroomError, ValueError) as exc:
             st.error(str(exc))
 
     st.divider()

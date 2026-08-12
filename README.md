@@ -52,6 +52,26 @@ streamlit run app.py
 
 默认数据目录是 `.tuoming-data/`，可通过 `TUOMING_DATA_DIR` 修改。生产环境应把 `MASKING_MASTER_KEY` 放在密钥管理服务中，而不是普通 `.env` 文件。
 
+## 大文件边界与资源设置
+
+当前版本面向 **16GB 内存的普通 Windows 电脑**，验收边界如下：
+
+- CSV 单文件不超过 **200MiB**，XLSX/XLSM 单文件不超过 **100MiB**。
+- 合并时主表制品不超过 **200MiB**，辅助表制品不超过 **50MiB**。
+- 导入后数据保存在本地加密原件和脱敏 Parquet 中；DuckDB 仅在本机扫描受授权制品。模型只接收脱敏请求、schema、行数和 artifact ID，**不会接收数据行、文件路径、SQL 或 DuckDB 配置**。
+- 导入写入前会检查 `TUOMING_DATA_DIR` 所在卷的可用空间，保守要求为输入文件的 3 倍加 DuckDB 临时空间额度。该检查不原子预留空间；磁盘不足时请先清理空间或减小文件。
+- CSV 和 Excel 导入均分批处理。结果预览最多 1,000 行；CSV 与还原导出按批流式写入，较大的结果应优先选择 CSV/Parquet，Excel 仍受 100,000 行和估算 50MiB 上限约束。
+
+可通过以下环境变量调整每任务资源上限；安全上限分别是 2GiB、4 线程和 4GiB，超过会拒绝启动任务：
+
+```dotenv
+DUCKDB_MEMORY_LIMIT=2GiB
+DUCKDB_THREADS=4
+DUCKDB_MAX_TEMP_DIRECTORY_SIZE=4GiB
+```
+
+DuckDB 内存或临时磁盘达到上限时，服务会返回可操作的资源提示。超过 24 小时的任务临时文件可调用 `tuoming_agent.maintenance.cleanup_stale_files(...)` 清理；清理只识别数据目录下的任务自有模式，不跟随符号链接/重解析点，并保护 SQLite 已引用的上传与制品路径。
+
 ## 验证
 
 ```powershell
@@ -59,6 +79,15 @@ python -m pytest
 python -m ruff check .
 python -m compileall -q tuoming_agent
 ```
+
+快速套件包含一个约 1MiB 的真实流水线 smoke 基准。发布前可按需生成近 200MiB CSV 并执行完整验收；测试数据写入 pytest 临时目录，不需要提交大型 fixture：
+
+```powershell
+$env:TUOMING_RUN_LARGE_BENCHMARK = "1"
+python -m pytest tests/performance/test_200mb_pipeline.py -m performance -s
+```
+
+基准报告导入、代表性筛选/分组/排序耗时；安装 `psutil` 时还会报告采样峰值 RSS。200MiB CSV 的目标导入时间为 10 分钟以内，实际结果受磁盘、CPU 和安全扫描内容影响。
 
 ## 安全边界
 

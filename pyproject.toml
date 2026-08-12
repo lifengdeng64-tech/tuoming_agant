@@ -36,6 +36,9 @@ include = ["tuoming_agent*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "performance: opt-in large-file performance acceptance tests",
+]
 
 [tool.ruff]
 line-length = 100
