@@ -51,10 +51,12 @@ class SecureFileStore:
                     key, source, encrypted, aad, chunk_size
                 )
             target = target_dir / f"{content_hash}.enc"
-            if target.exists():
-                temporary.unlink()
-            else:
-                os.replace(temporary, target)
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                pass
+            finally:
+                temporary.unlink(missing_ok=True)
             return target, content_hash, byte_size
         except Exception:
             temporary.unlink(missing_ok=True)
@@ -138,8 +140,12 @@ class ArtifactStore:
             return target
         except Exception:
             if writer is not None:
-                writer.close()
-            temporary.unlink(missing_ok=True)
+                try:
+                    writer.close()
+                finally:
+                    temporary.unlink(missing_ok=True)
+            else:
+                temporary.unlink(missing_ok=True)
             raise
 
     @staticmethod

@@ -277,7 +277,7 @@ def _render_data_view(
         key=f"uploader-{workspace_id}",
         label_visibility="collapsed",
     )
-    prepared: list[tuple[str, bytes, dict[str, dict[str, ColumnPolicy]]]] = []
+    prepared: list[tuple[str, Any, dict[str, dict[str, ColumnPolicy]]]] = []
 
     for uploaded in uploaded_files or []:
         try:
@@ -286,11 +286,12 @@ def _render_data_view(
         except ValueError as exc:
             st.error(f"{uploaded.name}: {exc}")
             continue
-        content = uploaded.getvalue()
-        file_key = hashlib.sha256(content).hexdigest()[:12]
+        file_key = hashlib.sha256(
+            f"{uploaded.name}|{uploaded.size}".encode()
+        ).hexdigest()[:12]
         file_policies: dict[str, dict[str, ColumnPolicy]] = {}
         with st.expander(
-            f"{uploaded.name} · {_format_bytes(len(content))} · {len(tables)} 张表",
+            f"{uploaded.name} · {_format_bytes(uploaded.size)} · {len(tables)} 张表",
             expanded=True,
             icon=":material/draft:",
         ):
@@ -335,7 +336,7 @@ def _render_data_view(
                         use_container_width=True,
                         hide_index=True,
                     )
-        prepared.append((uploaded.name, content, file_policies))
+        prepared.append((uploaded.name, uploaded, file_policies))
 
     if prepared and st.button(
         f"确认并追加 {len(prepared)} 个文件",
@@ -345,8 +346,8 @@ def _render_data_view(
     ):
         try:
             results = [
-                services.ingestion.ingest(tenant_id, workspace_id, filename, content, policies)
-                for filename, content, policies in prepared
+                services.ingestion.ingest(tenant_id, workspace_id, filename, source, policies)
+                for filename, source, policies in prepared
             ]
             added = sum(not result.duplicate for result in results)
             duplicates = len(results) - added

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import struct
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
+from threading import Barrier
 
 import pandas as pd
 import pytest
@@ -13,7 +16,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import iter_file_chunks, preview_file
 from tuoming_agent.ingestion.service import UnsafeIngestionError
-from tuoming_agent.security.crypto import derive_key
+from tuoming_agent.security.crypto import STREAM_MAGIC, derive_key
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
 from tuoming_agent.ui import app as ui_app
 
@@ -124,6 +127,39 @@ def test_ui_rejects_an_oversized_upload_before_reading_its_content(monkeypatch) 
     assert errors == ["too-large.csv: CSV uploads must be 200 MiB or smaller."]
 
 
+def test_ui_accepted_upload_never_calls_getvalue(monkeypatch) -> None:
+    class AcceptedUpload(BytesIO):
+        name = "accepted.csv"
+        size = len(b"value\n1\n")
+
+        def getvalue(self) -> bytes:
+            raise AssertionError("accepted uploads must stay stream based")
+
+    class EmptyContainer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    uploaded = AcceptedUpload(b"value\n1\n")
+    monkeypatch.setattr(ui_app.st, "file_uploader", lambda *args, **kwargs: [uploaded])
+    monkeypatch.setattr(ui_app.st, "expander", lambda *args, **kwargs: EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "data_editor", lambda frame, **kwargs: frame)
+    monkeypatch.setattr(ui_app.st, "dataframe", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ui_app.st, "markdown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ui_app.st, "divider", lambda: None)
+    monkeypatch.setattr(
+        ui_app.st, "columns", lambda *args, **kwargs: [EmptyContainer(), EmptyContainer()]
+    )
+    monkeypatch.setattr(ui_app.st, "button", lambda *args, **kwargs: False)
+    monkeypatch.setattr(ui_app, "_section_heading", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ui_app, "_empty_state", lambda *args, **kwargs: None)
+
+    ui_app._render_data_view(object(), "tenant", "workspace", [], [])
+
+
 def test_secure_file_store_streams_encryption_and_reads_legacy_files(tmp_path: Path) -> None:
     store = SecureFileStore(tmp_path, b"test-master-key-material-32-bytes!")
     content = (b"streaming-content-" * 1000) + b"end"
@@ -163,6 +199,29 @@ def test_secure_stream_rejects_tampering_and_truncation(tmp_path: Path) -> None:
         store.read("tenant-a", "workspace-a", content_hash, path)
 
 
+def test_secure_stream_rejects_oversized_frame_before_payload_read(tmp_path: Path) -> None:
+    class HeaderOnlyStream(BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            if size > 1024:
+                raise AssertionError("malicious length must not drive a huge read")
+            return super().read(size)
+
+    payload = STREAM_MAGIC + struct.pack(">BQI", 0, 0, 0xFFFFFFFF)
+    path = tmp_path / "malicious.enc"
+    path.write_bytes(payload)
+    original_open = Path.open
+
+    def bounded_open(selected, *args, **kwargs):
+        if selected == path:
+            return HeaderOnlyStream(payload)
+        return original_open(selected, *args, **kwargs)
+
+    store = SecureFileStore(tmp_path, b"test-master-key-material-32-bytes!")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(Path, "open", bounded_open)
+        with pytest.raises(ValueError, match="frame length"):
+            store.read("tenant-a", "workspace-a", "0" * 64, path)
+
 def test_csv_parser_yields_bounded_row_chunks_without_unbounded_reads() -> None:
     content = pd.DataFrame({"name": ["same", "other", "same", "last"], "value": range(4)})
     source = BoundedReadStream(content.to_csv(index=False).encode())
@@ -172,6 +231,15 @@ def test_csv_parser_yields_bounded_row_chunks_without_unbounded_reads() -> None:
     assert [len(chunk.dataframe) for chunk in chunks] == [2, 2]
     assert [chunk.logical_name for chunk in chunks] == ["records", "records"]
     assert pd.concat([chunk.dataframe for chunk in chunks], ignore_index=True).equals(content)
+
+
+def test_csv_encoding_retries_after_long_ascii_prefix_before_gbk_text() -> None:
+    prefix = "value\n" + ("ascii\n" * 12_000)
+    payload = prefix.encode("ascii") + "中文\n".encode("gbk")
+
+    chunks = list(iter_file_chunks("gbk.csv", BoundedReadStream(payload), chunk_rows=20_000))
+
+    assert chunks[0].dataframe.iloc[-1, 0] == "中文"
 
 
 def test_excel_parser_uses_cached_formula_values_and_row_chunks() -> None:
@@ -190,6 +258,21 @@ def test_excel_parser_uses_cached_formula_values_and_row_chunks() -> None:
     assert [len(chunk.dataframe) for chunk in chunks] == [2, 1]
     assert chunks[0].sheet_name == "Cached"
     assert chunks[0].dataframe["calculated"].tolist() == [3, 4]
+
+
+def test_excel_parser_makes_blank_and_duplicate_headers_unique() -> None:
+    source = BytesIO()
+    with pd.ExcelWriter(source, engine="xlsxwriter") as writer:
+        worksheet = writer.book.add_worksheet("Headers")
+        writer.sheets["Headers"] = worksheet
+        worksheet.write_row(0, 0, [None, "value", "value"])
+        worksheet.write_row(1, 0, ["ordinary", "safe", "safe"])
+        worksheet.write_row(2, 0, ["ordinary", "safe", "late@example.com"])
+
+    chunks = list(iter_file_chunks("book.xlsx", BytesIO(source.getvalue()), chunk_rows=10))
+
+    assert chunks[0].dataframe.columns.tolist() == ["Unnamed: 0", "value", "value.1"]
+    assert chunks[0].dataframe.loc[1, "value.1"] == "late@example.com"
 
 
 def test_artifact_store_writes_multiple_chunks_with_one_schema(tmp_path: Path) -> None:
@@ -224,6 +307,119 @@ def test_ingestion_validates_sensitive_values_discovered_in_a_later_batch(
     assert services.repository.list_files("tenant-a", workspace.id) == []
     assert services.repository.list_artifacts("tenant-a", workspace.id) == []
     assert list((services.ingestion.artifact_store.root / "artifacts").rglob("*.parquet")) == []
+
+
+def test_ingestion_scans_past_first_200_values_within_each_chunk(services, workspace) -> None:
+    content = pd.DataFrame(
+        {"value": (["ordinary"] * 201) + ["late@example.com"]}
+    ).to_csv(index=False).encode()
+
+    with pytest.raises(UnsafeIngestionError, match="value"):
+        services.ingestion.ingest(
+            "tenant-a", workspace.id, "within.csv", content, {"within": {}}
+        )
+
+    assert services.repository.list_files("tenant-a", workspace.id) == []
+
+
+def test_atomic_publication_rolls_back_all_metadata_on_mid_transaction_failure(
+    services, workspace
+) -> None:
+    content = pd.DataFrame({"value": [1]}).to_csv(index=False).encode()
+    original = services.repository._publish_artifact
+
+    def fail_after_insert(connection, artifact):
+        original(connection, artifact)
+        raise RuntimeError("mid-publication failure")
+
+    services.repository._publish_artifact = fail_after_insert
+    try:
+        with pytest.raises(RuntimeError, match="mid-publication failure"):
+            services.ingestion.ingest(
+                "tenant-a", workspace.id, "atomic.csv", content, {"atomic": {}}
+            )
+    finally:
+        services.repository._publish_artifact = original
+
+    assert services.repository.list_files("tenant-a", workspace.id) == []
+    assert services.repository.list_artifacts("tenant-a", workspace.id) == []
+    assert services.repository.list_datasets("tenant-a", workspace.id) == []
+    assert list((services.ingestion.artifact_store.root / "artifacts").rglob("*.parquet")) == []
+
+    retry = services.ingestion.ingest(
+        "tenant-a", workspace.id, "atomic.csv", content, {"atomic": {}}
+    )
+    assert retry.duplicate is False
+    assert len(services.repository.list_files("tenant-a", workspace.id)) == 1
+
+
+def test_source_mutation_removes_new_encrypted_orphan(monkeypatch, services, workspace) -> None:
+    orphan = services.ingestion.secure_file_store.root / "mutated.enc"
+
+    def mismatched_stream_write(*args, **kwargs):
+        orphan.write_bytes(b"orphan")
+        return orphan, "f" * 64, 999
+
+    monkeypatch.setattr(
+        services.ingestion.secure_file_store, "write_stream", mismatched_stream_write
+    )
+    content = pd.DataFrame({"value": [1]}).to_csv(index=False).encode()
+
+    with pytest.raises(ValueError, match="changed"):
+        services.ingestion.ingest(
+            "tenant-a", workspace.id, "mutated.csv", content, {"mutated": {}}
+        )
+
+    assert not orphan.exists()
+
+
+def test_duplicate_race_cleans_loser_files_and_returns_existing_result(
+    monkeypatch, services, workspace
+) -> None:
+    content = pd.DataFrame({"value": [1]}).to_csv(index=False).encode()
+    first = services.ingestion.ingest(
+        "tenant-a", workspace.id, "race.csv", content, {"race": {}}
+    )
+    monkeypatch.setattr(services.repository, "find_file_by_hash", lambda *args: None)
+
+    duplicate = services.ingestion.ingest(
+        "tenant-a", workspace.id, "race.csv", content, {"race": {}}
+    )
+
+    assert duplicate.duplicate is True
+    assert duplicate.file_id == first.file_id
+    assert duplicate.artifacts == first.artifacts
+    assert len(list((services.ingestion.artifact_store.root / "artifacts").rglob("*.parquet"))) == 1
+
+
+def test_concurrent_duplicate_ingestions_publish_one_complete_version(
+    monkeypatch, services, workspace
+) -> None:
+    content = pd.DataFrame({"value": [1, 2]}).to_csv(index=False).encode()
+    barrier = Barrier(2)
+    original_find = services.repository.find_file_by_hash
+
+    def synchronized_find(*args):
+        result = original_find(*args)
+        barrier.wait(timeout=10)
+        return result
+
+    monkeypatch.setattr(services.repository, "find_file_by_hash", synchronized_find)
+
+    def ingest_once():
+        return services.ingestion.ingest(
+            "tenant-a", workspace.id, "concurrent.csv", content, {"concurrent": {}}
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: ingest_once(), range(2)))
+
+    assert sorted(result.duplicate for result in results) == [False, True]
+    assert results[0].file_id == results[1].file_id
+    assert len(services.repository.list_files("tenant-a", workspace.id)) == 1
+    assert len(services.repository.list_artifacts("tenant-a", workspace.id)) == 1
+    assert services.repository.list_datasets("tenant-a", workspace.id)[0]["version"] == 1
+    assert len(list((services.ingestion.artifact_store.root / "artifacts").rglob("*.parquet"))) == 1
 
 
 def test_ingestion_does_not_publish_metadata_when_chunked_parquet_write_fails(

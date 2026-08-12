@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
@@ -35,7 +36,7 @@ def iter_file_chunks(
         try:
             for dataframe in pd.read_csv(source, encoding=encoding, chunksize=chunk_rows):
                 yield ParsedTable(stem, None, dataframe)
-        except pd.errors.ParserError as exc:
+        except (UnicodeDecodeError, pd.errors.ParserError) as exc:
             raise UnsupportedFileError("CSV structure could not be parsed.") from exc
         return
     if suffix in {".xlsx", ".xlsm"}:
@@ -50,7 +51,7 @@ def iter_file_chunks(
                     header = next(rows, None)
                     if header is None:
                         continue
-                    columns = [str(value) if value is not None else "" for value in header]
+                    columns = _normalize_excel_headers(header)
                     while batch := list(islice(rows, chunk_rows)):
                         yield ParsedTable(
                             f"{stem}::{worksheet.title}",
@@ -105,15 +106,33 @@ def _read_csv(content: bytes | BinaryIO, sample_rows: int | None = None) -> pd.D
 
 
 def _detect_csv_encoding(source: BinaryIO, sample_size: int = 64 * 1024) -> str:
-    source.seek(0)
-    sample = source.read(sample_size)
     for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5"):
+        source.seek(0)
+        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
         try:
-            sample.decode(encoding)
+            while chunk := source.read(sample_size):
+                decoder.decode(chunk, final=False)
+            decoder.decode(b"", final=True)
             return encoding
         except UnicodeDecodeError:
             continue
     raise UnsupportedFileError("CSV encoding is unsupported.")
+
+
+def _normalize_excel_headers(header: tuple[object, ...]) -> list[str]:
+    columns: list[str] = []
+    counts: dict[str, int] = {}
+    for index, value in enumerate(header):
+        base = f"Unnamed: {index}" if value is None or str(value) == "" else str(value)
+        occurrence = counts.get(base, 0)
+        candidate = base if occurrence == 0 else f"{base}.{occurrence}"
+        while candidate in counts:
+            occurrence += 1
+            candidate = f"{base}.{occurrence}"
+        counts[base] = occurrence + 1
+        counts[candidate] = 1
+        columns.append(candidate)
+    return columns
 
 
 def _read_excel(

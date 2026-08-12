@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 STREAM_MAGIC = b"TUOMING\x01"
+MAX_STREAM_FRAME_SIZE = 1024 * 1024
 _FRAME_HEADER = struct.Struct(">BQI")
 _FINAL_FRAME = 1
 
@@ -40,6 +41,8 @@ def encrypt_stream_frames(
     """Encrypt bounded source reads as independently authenticated AES-GCM frames."""
     if chunk_size < 1:
         raise ValueError("chunk_size must be positive.")
+    if chunk_size > MAX_STREAM_FRAME_SIZE:
+        raise ValueError("chunk_size exceeds the encrypted stream frame limit.")
     import hashlib
 
     digest = hashlib.sha256()
@@ -85,14 +88,17 @@ def decrypt_stream_frames(key: bytes, source: BinaryIO, aad: bytes) -> Iterator[
         frame_type, frame_index, plaintext_size = _FRAME_HEADER.unpack(header)
         if frame_index != expected_index or frame_type not in (0, _FINAL_FRAME):
             raise ValueError("Encrypted stream frame sequence is invalid.")
+        if frame_type == _FINAL_FRAME:
+            if plaintext_size != 40:
+                raise ValueError("Encrypted stream final frame length is invalid.")
+        elif plaintext_size > MAX_STREAM_FRAME_SIZE:
+            raise ValueError("Encrypted stream data frame length exceeds the limit.")
         nonce = source.read(12)
         ciphertext = source.read(plaintext_size + 16)
         if len(nonce) != 12 or len(ciphertext) != plaintext_size + 16:
             raise ValueError("Encrypted stream frame is truncated.")
         plaintext = aesgcm.decrypt(nonce, ciphertext, aad + header)
         if frame_type == _FINAL_FRAME:
-            if plaintext_size != 40:
-                raise ValueError("Encrypted stream final frame is invalid.")
             expected_digest, expected_size = plaintext[:32], struct.unpack(">Q", plaintext[32:])[0]
             if digest.digest() != expected_digest or total_size != expected_size:
                 raise ValueError("Encrypted stream integrity metadata does not match.")

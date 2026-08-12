@@ -350,6 +350,130 @@ class SQLiteRepository:
             )
         return record
 
+    def publish_ingestion(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        sha256: str,
+        original_name: str,
+        encrypted_path: str,
+        byte_size: int,
+        tables: list[
+            tuple[ArtifactRecord, str | None, dict[str, tuple[str, str, int]]]
+        ],
+    ) -> tuple[dict[str, Any], bool]:
+        """Publish one ingestion atomically, returning the winner of duplicate races."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            workspace = connection.execute(
+                "SELECT tenant_id FROM workspaces WHERE id = ?", (workspace_id,)
+            ).fetchone()
+            if workspace is None:
+                raise RecordNotFoundError("Workspace not found.")
+            if workspace["tenant_id"] != tenant_id:
+                raise AuthorizationError("Workspace belongs to another tenant.")
+            existing = connection.execute(
+                """SELECT * FROM files
+                WHERE tenant_id = ? AND workspace_id = ? AND sha256 = ?""",
+                (tenant_id, workspace_id, sha256),
+            ).fetchone()
+            if existing:
+                return dict(existing), True
+
+            file_record = {
+                "id": str(uuid.uuid4()),
+                "tenant_id": tenant_id,
+                "workspace_id": workspace_id,
+                "sha256": sha256,
+                "original_name": original_name,
+                "encrypted_path": encrypted_path,
+                "byte_size": byte_size,
+                "created_at": utc_now(),
+            }
+            connection.execute(
+                """INSERT INTO files(
+                    id, tenant_id, workspace_id, sha256, original_name,
+                    encrypted_path, byte_size, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                tuple(file_record.values()),
+            )
+            for artifact, sheet_name, policies in tables:
+                self._publish_artifact(connection, artifact)
+                connection.execute(
+                    """INSERT OR IGNORE INTO datasets(
+                        id, tenant_id, workspace_id, logical_name, created_at
+                    ) VALUES (?, ?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), tenant_id, workspace_id, artifact.name, utc_now()),
+                )
+                dataset = connection.execute(
+                    """SELECT id FROM datasets
+                    WHERE tenant_id = ? AND workspace_id = ? AND logical_name = ?""",
+                    (tenant_id, workspace_id, artifact.name),
+                ).fetchone()
+                next_version = connection.execute(
+                    """SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_versions
+                    WHERE dataset_id = ?""",
+                    (dataset["id"],),
+                ).fetchone()[0]
+                version_id = str(uuid.uuid4())
+                connection.execute(
+                    """INSERT INTO dataset_versions(
+                        id, tenant_id, dataset_id, file_id, artifact_id,
+                        sheet_name, version, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        version_id,
+                        tenant_id,
+                        dataset["id"],
+                        file_record["id"],
+                        artifact.id,
+                        sheet_name,
+                        next_version,
+                        utc_now(),
+                    ),
+                )
+                for column_name, (domain, normalizer, key_version) in policies.items():
+                    connection.execute(
+                        """INSERT INTO column_policies(
+                            id, tenant_id, dataset_version_id, column_name,
+                            masking_domain, normalizer, key_version, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            str(uuid.uuid4()),
+                            tenant_id,
+                            version_id,
+                            column_name,
+                            domain,
+                            normalizer,
+                            key_version,
+                            utc_now(),
+                        ),
+                    )
+            return file_record, False
+
+    @staticmethod
+    def _publish_artifact(connection: sqlite3.Connection, artifact: ArtifactRecord) -> None:
+        lineage = {name: value.to_dict() for name, value in artifact.lineage.items()}
+        connection.execute(
+            """INSERT INTO artifacts(
+                id, tenant_id, workspace_id, kind, name, path, row_count,
+                schema_json, lineage_json, parent_ids_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                artifact.id,
+                artifact.tenant_id,
+                artifact.workspace_id,
+                artifact.kind,
+                artifact.name,
+                str(artifact.path),
+                artifact.row_count,
+                json.dumps(artifact.schema, ensure_ascii=False),
+                json.dumps(lineage, ensure_ascii=False),
+                json.dumps(artifact.parent_ids),
+                artifact.created_at or utc_now(),
+            ),
+        )
+
     def get_file_versions(self, tenant_id: str, file_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
             owner = connection.execute(

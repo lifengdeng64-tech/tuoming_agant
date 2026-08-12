@@ -75,7 +75,7 @@ class IngestionService:
             if table.logical_name not in table_names:
                 table_names.append(table.logical_name)
             table_policies = policies.get(table.logical_name, {})
-            detected = detect_sensitive_columns(table.dataframe)
+            detected = detect_sensitive_columns(table.dataframe, sample_size=None)
             missing_policies = sorted(detected - set(table_policies))
             if missing_policies:
                 raise UnsafeIngestionError(
@@ -86,6 +86,7 @@ class IngestionService:
 
         pending: list[tuple[ArtifactRecord, str | None, dict[str, ColumnPolicy]]] = []
         created_paths: list[Path] = []
+        encrypted_path: Path | None = None
         source.seek(0)
         try:
             chunks = iter_file_chunks(filename, source)
@@ -102,7 +103,7 @@ class IngestionService:
                 ):
                     nonlocal row_count, schema, lineage, sheet_name
                     for table in selected_chunks:
-                        detected = detect_sensitive_columns(table.dataframe)
+                        detected = detect_sensitive_columns(table.dataframe, sample_size=None)
                         missing_policies = sorted(detected - set(selected_policies))
                         if missing_policies:
                             raise UnsafeIngestionError(
@@ -151,39 +152,51 @@ class IngestionService:
         except Exception:
             for path in created_paths:
                 path.unlink(missing_ok=True)
+            if encrypted_path is not None:
+                encrypted_path.unlink(missing_ok=True)
             raise
 
-        file_record = self.repository.create_file(
-            tenant_id,
-            workspace_id,
-            content_hash,
-            filename,
-            str(encrypted_path),
-            byte_size,
-        )
-        created: list[ArtifactRecord] = []
-        for artifact, sheet_name, table_policies in pending:
-            self.repository.create_artifact(artifact)
-            dataset = self.repository.get_or_create_dataset(
-                tenant_id, workspace_id, artifact.name
-            )
-            version = self.repository.create_dataset_version(
-                tenant_id,
-                dataset["id"],
-                file_record["id"],
-                artifact.id,
+        publication = [
+            (
+                artifact,
                 sheet_name,
+                {
+                    column_name: (
+                        policy.domain,
+                        policy.normalizer,
+                        self.masking_service.vault.key_version,
+                    )
+                    for column_name, policy in table_policies.items()
+                },
             )
-            for column_name, policy in table_policies.items():
-                self.repository.add_column_policy(
-                    tenant_id,
-                    version["id"],
-                    column_name,
-                    policy.domain,
-                    policy.normalizer,
-                    self.masking_service.vault.key_version,
-                )
-            created.append(artifact)
+            for artifact, sheet_name, table_policies in pending
+        ]
+        try:
+            file_record, lost_race = self.repository.publish_ingestion(
+                tenant_id,
+                workspace_id,
+                content_hash,
+                filename,
+                str(encrypted_path),
+                byte_size,
+                publication,
+            )
+        except Exception:
+            for path in created_paths:
+                path.unlink(missing_ok=True)
+            encrypted_path.unlink(missing_ok=True)
+            raise
+        if lost_race:
+            for path in created_paths:
+                path.unlink(missing_ok=True)
+            versions = self.repository.get_file_versions(tenant_id, file_record["id"])
+            artifacts = tuple(
+                self.repository.get_artifact(tenant_id, version["artifact_id"])
+                for version in versions
+            )
+            return IngestionResult(file_record["id"], content_hash, artifacts, True)
+
+        created = [artifact for artifact, _, _ in pending]
 
         self.repository.touch_workspace(tenant_id, workspace_id)
         self.repository.add_audit_event(

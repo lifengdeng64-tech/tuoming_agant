@@ -13,15 +13,20 @@ SENSITIVE_COLUMN_NAMES = re.compile(
 )
 
 
-def detect_sensitive_columns(dataframe: pd.DataFrame, sample_size: int = 200) -> set[str]:
+def detect_sensitive_columns(
+    dataframe: pd.DataFrame, sample_size: int | None = 200
+) -> set[str]:
     detected: set[str] = set()
     for column in dataframe.columns:
         column_name = str(column)
         if SENSITIVE_COLUMN_NAMES.search(column_name):
             detected.add(column_name)
             continue
-        values = dataframe[column].dropna().astype(str).head(sample_size)
-        if any(pattern.search(value) for value in values for pattern in PII_PATTERNS.values()):
+        values = dataframe[column].dropna()
+        if sample_size is not None:
+            values = values.head(sample_size)
+        if any(
+            pattern.search(str(value)) for value in values for pattern in PII_PATTERNS.values()
+        ):
             detected.add(column_name)
     return detected
-
