@@ -9,7 +9,6 @@ from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import preview_file
 from tuoming_agent.ui import app as ui_app
 
-
 MIB = 1024 * 1024
 
 
@@ -28,6 +27,24 @@ def test_upload_size_accepts_exact_file_limit(filename: str, limit: int) -> None
 def test_upload_size_rejects_files_larger_than_limit(filename: str, limit: int) -> None:
     with pytest.raises(ValueError):
         validate_upload_size(filename, limit + 1)
+
+
+def test_ingestion_rejects_an_oversized_upload_before_parsing_or_writing(
+    services, workspace
+) -> None:
+    class OversizedCsv(bytes):
+        def __len__(self) -> int:
+            return 200 * MIB + 1
+
+    content = OversizedCsv(b"value\n1\n")
+
+    with pytest.raises(ValueError, match="CSV uploads must be 200 MiB or smaller"):
+        services.ingestion.ingest(
+            "tenant-a", workspace.id, "too-large.csv", content, policies={}
+        )
+
+    assert services.repository.list_files("tenant-a", workspace.id) == []
+    assert services.repository.list_artifacts("tenant-a", workspace.id) == []
 
 
 def test_csv_preview_reads_at_most_default_sample_rows() -> None:
@@ -71,7 +88,11 @@ def test_ui_rejects_an_oversized_upload_before_reading_its_content(monkeypatch) 
     monkeypatch.setattr(ui_app.st, "file_uploader", lambda *args, **kwargs: [OversizedUpload()])
     monkeypatch.setattr(ui_app.st, "error", errors.append)
     monkeypatch.setattr(ui_app.st, "divider", lambda: None)
-    monkeypatch.setattr(ui_app.st, "columns", lambda *args, **kwargs: [EmptyContainer(), EmptyContainer()])
+    monkeypatch.setattr(
+        ui_app.st,
+        "columns",
+        lambda *args, **kwargs: [EmptyContainer(), EmptyContainer()],
+    )
     monkeypatch.setattr(ui_app.st, "button", lambda *args, **kwargs: False)
     monkeypatch.setattr(ui_app, "_section_heading", lambda *args, **kwargs: None)
     monkeypatch.setattr(ui_app, "_empty_state", lambda *args, **kwargs: None)

@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import ParsedTable, parse_file
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
 from tuoming_agent.models import ArtifactRecord, utc_now
@@ -49,6 +50,7 @@ class IngestionService:
         content: bytes,
         policies: dict[str, dict[str, ColumnPolicy]],
     ) -> IngestionResult:
+        validate_upload_size(filename, len(content))
         content_hash = hashlib.sha256(content).hexdigest()
         duplicate = self.repository.find_file_by_hash(tenant_id, workspace_id, content_hash)
         if duplicate:
@@ -141,4 +143,3 @@ class IngestionService:
                 for column in dataframe.columns
             ]
         }
-

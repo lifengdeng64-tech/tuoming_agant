@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-
 MIB = 1024 * 1024
 _SIZE_LIMITS = {
     ".csv": 200 * MIB,
