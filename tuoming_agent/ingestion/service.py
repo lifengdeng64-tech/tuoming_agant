@@ -188,14 +188,14 @@ class IngestionService:
         except Exception:
             for path in created_paths:
                 path.unlink(missing_ok=True)
-            if encrypted_created and not self.repository.find_file_by_hash(
-                tenant_id, workspace_id, content_hash
-            ):
+            if encrypted_created:
                 encrypted_path.unlink(missing_ok=True)
             raise
         if lost_race:
             for path in created_paths:
                 path.unlink(missing_ok=True)
+            if encrypted_created:
+                encrypted_path.unlink(missing_ok=True)
             versions = self.repository.get_file_versions(tenant_id, file_record["id"])
             artifacts = tuple(
                 self.repository.get_artifact(tenant_id, version["artifact_id"])

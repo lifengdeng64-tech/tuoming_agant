@@ -52,16 +52,9 @@ class SecureFileStore:
                 content_hash, byte_size = encrypt_stream_frames(
                     key, source, encrypted, aad, chunk_size
                 )
-            target = target_dir / f"{content_hash}.enc"
-            created = False
-            try:
-                os.link(temporary, target)
-                created = True
-            except FileExistsError:
-                pass
-            finally:
-                temporary.unlink(missing_ok=True)
-            return target, content_hash, byte_size, created
+            target = target_dir / f"{content_hash}.{uuid.uuid4().hex}.enc"
+            os.replace(temporary, target)
+            return target, content_hash, byte_size, True
         except Exception:
             temporary.unlink(missing_ok=True)
             raise

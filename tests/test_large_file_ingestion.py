@@ -6,7 +6,7 @@ import struct
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event, local
 
 import pandas as pd
 import pytest
@@ -181,6 +181,18 @@ def test_secure_file_store_streams_encryption_and_reads_legacy_files(tmp_path: P
     nonce = os.urandom(12)
     legacy_path.write_bytes(nonce + AESGCM(key).encrypt(nonce, b"legacy", aad))
     assert store.read("tenant-a", "workspace-a", legacy_hash, legacy_path) == b"legacy"
+
+
+def test_secure_stream_attempts_use_unique_owned_final_paths(tmp_path: Path) -> None:
+    store = SecureFileStore(tmp_path, b"test-master-key-material-32-bytes!")
+    content = b"same content"
+
+    first = store.write_stream("tenant-a", "workspace-a", BytesIO(content))
+    second = store.write_stream("tenant-a", "workspace-a", BytesIO(content))
+
+    assert first[0] != second[0]
+    assert first[0].exists() and second[0].exists()
+    assert first[3] is True and second[3] is True
 
 
 def test_secure_stream_rejects_tampering_and_truncation(tmp_path: Path) -> None:
@@ -510,6 +522,76 @@ def test_concurrent_duplicate_ingestions_publish_one_complete_version(
     assert len(services.repository.list_artifacts("tenant-a", workspace.id)) == 1
     assert services.repository.list_datasets("tenant-a", workspace.id)[0]["version"] == 1
     assert len(list((services.ingestion.artifact_store.root / "artifacts").rglob("*.parquet"))) == 1
+
+
+def test_failing_attempt_cleanup_cannot_delete_interleaved_winner_original(
+    monkeypatch, services, workspace
+) -> None:
+    content = pd.DataFrame({"value": [1, 2]}).to_csv(index=False).encode()
+    state = local()
+    initial_lookup = Barrier(2)
+    loser_written = Event()
+    winner_written = Event()
+    loser_done = Event()
+    original_find = services.repository.find_file_by_hash
+    original_write = services.ingestion.secure_file_store.write_stream
+    original_publish = services.repository.publish_ingestion
+
+    def synchronized_find(*args):
+        if not getattr(state, "initial_lookup_complete", False):
+            state.initial_lookup_complete = True
+            result = original_find(*args)
+            initial_lookup.wait(timeout=10)
+            return result
+        return original_find(*args)
+
+    def ordered_write(*args, **kwargs):
+        if state.role == "loser":
+            result = original_write(*args, **kwargs)
+            loser_written.set()
+            assert winner_written.wait(timeout=10)
+            return result
+        assert loser_written.wait(timeout=10)
+        result = original_write(*args, **kwargs)
+        winner_written.set()
+        return result
+
+    def ordered_publish(*args, **kwargs):
+        if state.role == "loser":
+            raise RuntimeError("forced creator publication failure")
+        assert loser_done.wait(timeout=10)
+        return original_publish(*args, **kwargs)
+
+    monkeypatch.setattr(services.repository, "find_file_by_hash", synchronized_find)
+    monkeypatch.setattr(services.ingestion.secure_file_store, "write_stream", ordered_write)
+    monkeypatch.setattr(services.repository, "publish_ingestion", ordered_publish)
+
+    def ingest_as(role):
+        state.role = role
+        try:
+            return services.ingestion.ingest(
+                "tenant-a", workspace.id, "interleaved.csv", content, {"interleaved": {}}
+            )
+        finally:
+            if role == "loser":
+                loser_done.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        loser_future = pool.submit(ingest_as, "loser")
+        winner_future = pool.submit(ingest_as, "winner")
+        with pytest.raises(RuntimeError, match="forced creator publication failure"):
+            loser_future.result(timeout=20)
+        winner = winner_future.result(timeout=20)
+
+    winner_file = original_find(
+        "tenant-a", workspace.id, winner.content_hash
+    )
+    winner_path = Path(winner_file["encrypted_path"])
+    assert winner_path.exists()
+    assert services.ingestion.secure_file_store.read(
+        "tenant-a", workspace.id, winner.content_hash, winner_path
+    ) == content
+    assert len(list(winner_path.parent.glob("*.enc"))) == 1
 
 
 def test_ingestion_does_not_publish_metadata_when_chunked_parquet_write_fails(
