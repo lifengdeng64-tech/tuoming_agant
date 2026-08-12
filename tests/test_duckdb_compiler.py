@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import math
 import os
 import pickle
+import shutil
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -11,9 +13,9 @@ import duckdb
 import pandas as pd
 import pytest
 
+import tuoming_agent.analysis.duckdb_compiler as compiler_module
 from tuoming_agent.analysis.duckdb_compiler import (
     AuthorizedSource,
-    DuckDBCompiler,
 )
 from tuoming_agent.analysis.duckdb_runtime import DuckDBRuntime
 from tuoming_agent.analysis.errors import SecurityPolicyViolation
@@ -37,10 +39,11 @@ def _artifact(services, workspace_id, name, dataframe, lineage=None):
 
 
 def _compile_and_fetch(services, config, workspace_id, plan):
-    compiled = DuckDBCompiler(services.repository).compile(
+    runtime = DuckDBRuntime(config)
+    compiled = runtime.compiler(services.repository).compile(
         "tenant-a", workspace_id, AnalysisPlan(**plan)
     )
-    with DuckDBRuntime(config).connection(compiled.sources) as connection:
+    with runtime.connection(compiled.sources) as connection:
         return compiled, connection.execute(compiled.sql, compiled.parameters).fetchall()
 
 
@@ -408,6 +411,118 @@ def test_numeric_cast_floor_division_and_modulo_follow_pandas(services, config, 
     assert actual == [(1, -2, 1), (-1, 1, 1)]
 
 
+def test_large_int64_floor_division_and_modulo_keep_exact_precision(
+    services, config, workspace
+):
+    artifact = _artifact(
+        services,
+        workspace.id,
+        "large-int64",
+        pd.DataFrame({"value": [9_223_372_036_854_775_000, -9_223_372_036_854_775_000]}),
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {
+            "input_artifact_id": artifact.id,
+            "operations": [
+                {
+                    "action": "derive",
+                    "column": "quotient",
+                    "expression": "col('value') // 3",
+                },
+                {
+                    "action": "derive",
+                    "column": "remainder",
+                    "expression": "col('value') % 3",
+                },
+                {"action": "select", "columns": ["quotient", "remainder"]},
+            ],
+        },
+    )
+    assert actual == [
+        (3_074_457_345_618_258_333, 1),
+        (-3_074_457_345_618_258_334, 2),
+    ]
+
+
+def test_integer_cast_accepts_strings_and_rejects_nulls_like_pandas(
+    services, config, workspace
+):
+    strings = _artifact(
+        services,
+        workspace.id,
+        "integer-strings",
+        pd.DataFrame({"value": ["1", "-2"]}),
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {
+            "input_artifact_id": strings.id,
+            "operations": [
+                {"action": "cast", "mapping": {"value": "int64"}},
+                {"action": "select", "columns": ["value"]},
+            ],
+        },
+    )
+    assert actual == [(1,), (-2,)]
+
+    nullable = _artifact(
+        services,
+        workspace.id,
+        "nullable-integer",
+        pd.DataFrame({"value": [1.0, None]}),
+    )
+    with pytest.raises(duckdb.Error):
+        _compile_and_fetch(
+            services,
+            config,
+            workspace.id,
+            {
+                "input_artifact_id": nullable.id,
+                "operations": [{"action": "cast", "mapping": {"value": "int64"}}],
+            },
+        )
+
+
+def test_integer_division_by_zero_matches_current_pandas_evaluator(
+    services, config, workspace
+):
+    artifact = _artifact(
+        services,
+        workspace.id,
+        "division-by-zero",
+        pd.DataFrame({"value": [3, -3]}),
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {
+            "input_artifact_id": artifact.id,
+            "operations": [
+                {
+                    "action": "derive",
+                    "column": "quotient",
+                    "expression": "col('value') // 0",
+                },
+                {
+                    "action": "derive",
+                    "column": "remainder",
+                    "expression": "col('value') % 0",
+                },
+                {"action": "select", "columns": ["quotient", "remainder"]},
+            ],
+        },
+    )
+    assert math.isinf(actual[0][0]) and actual[0][0] > 0
+    assert math.isinf(actual[1][0]) and actual[1][0] < 0
+    assert math.isnan(actual[0][1]) and math.isnan(actual[1][1])
+
+
 def test_negative_divisors_and_ne_none_follow_pandas(services, config, workspace):
     artifact = _artifact(
         services,
@@ -505,16 +620,20 @@ def test_schema_producers_cannot_collide_with_private_row_order(
     assert actual == [("b",)]
 
 
-def test_missing_column_is_rejected_before_sql_execution(services, workspace, source):
+def test_missing_column_is_rejected_before_sql_execution(services, config, workspace, source):
     plan = AnalysisPlan(
         input_artifact_id=source.id,
         operations=[{"action": "select", "columns": ["read_csv_auto('/secret')"]}],
     )
     with pytest.raises(ValueError, match="Columns do not exist"):
-        DuckDBCompiler(services.repository).compile("tenant-a", workspace.id, plan)
+        DuckDBRuntime(config).compiler(services.repository).compile(
+            "tenant-a", workspace.id, plan
+        )
 
 
-def test_compiler_rejects_cross_workspace_and_cross_tenant_sources(services, workspace, source):
+def test_compiler_rejects_cross_workspace_and_cross_tenant_sources(
+    services, config, workspace, source
+):
     other_workspace = services.repository.create_workspace("tenant-a", "other")
     other_workspace_artifact = _artifact(
         services, other_workspace.id, "other", pd.DataFrame({"id": [1]})
@@ -524,7 +643,9 @@ def test_compiler_rejects_cross_workspace_and_cross_tenant_sources(services, wor
         operations=[{"action": "head", "rows": 1}],
     )
     with pytest.raises(SecurityPolicyViolation, match="another workspace"):
-        DuckDBCompiler(services.repository).compile("tenant-a", workspace.id, cross_workspace)
+        DuckDBRuntime(config).compiler(services.repository).compile(
+            "tenant-a", workspace.id, cross_workspace
+        )
 
     services.repository.ensure_tenant("tenant-b")
     tenant_b_workspace = services.repository.create_workspace("tenant-b", "tenant-b-workspace")
@@ -541,10 +662,14 @@ def test_compiler_rejects_cross_workspace_and_cross_tenant_sources(services, wor
         operations=[{"action": "head", "rows": 1}],
     )
     with pytest.raises(AuthorizationError, match="another tenant"):
-        DuckDBCompiler(services.repository).compile("tenant-a", workspace.id, cross_tenant)
+        DuckDBRuntime(config).compiler(services.repository).compile(
+            "tenant-a", workspace.id, cross_tenant
+        )
 
 
-def test_merge_rejects_secondary_artifact_larger_than_50_mib(services, workspace, source):
+def test_merge_rejects_secondary_artifact_larger_than_50_mib(
+    services, config, workspace, source
+):
     right = _artifact(services, workspace.id, "large-right", pd.DataFrame({"id": [1]}))
     with right.path.open("r+b") as stream:
         stream.truncate(50 * MIB + 1)
@@ -560,13 +685,16 @@ def test_merge_rejects_secondary_artifact_larger_than_50_mib(services, workspace
         ],
     )
     with pytest.raises(ValueError, match="secondary artifact.*50 MiB"):
-        DuckDBCompiler(services.repository).compile("tenant-a", workspace.id, plan)
+        DuckDBRuntime(config).compiler(services.repository).compile(
+            "tenant-a", workspace.id, plan
+        )
 
 
 def test_runtime_registers_only_trusted_sources_then_locks_external_access(
     services, config, workspace, source, tmp_path
 ):
-    compiled = DuckDBCompiler(services.repository).compile(
+    runtime = DuckDBRuntime(config)
+    compiled = runtime.compiler(services.repository).compile(
         "tenant-a",
         workspace.id,
         AnalysisPlan(
@@ -576,7 +704,7 @@ def test_runtime_registers_only_trusted_sources_then_locks_external_access(
     )
     untrusted_csv = tmp_path / "untrusted.csv"
     untrusted_csv.write_text("secret\nvalue\n", encoding="utf-8")
-    with DuckDBRuntime(config).connection(compiled.sources) as connection:
+    with runtime.connection(compiled.sources) as connection:
         settings = connection.execute(
             """SELECT current_setting('memory_limit'), current_setting('threads'),
                       current_setting('max_temp_directory_size'),
@@ -605,8 +733,10 @@ def test_runtime_registers_only_trusted_sources_then_locks_external_access(
             connection.execute("SET enable_external_access=true")
 
 
-def test_runtime_rejects_dataclass_replacement_of_trusted_source(services, workspace, source):
-    compiled = DuckDBCompiler(services.repository).compile(
+def test_runtime_rejects_dataclass_replacement_of_trusted_source(
+    services, config, workspace, source
+):
+    compiled = DuckDBRuntime(config).compiler(services.repository).compile(
         "tenant-a",
         workspace.id,
         AnalysisPlan(
@@ -619,9 +749,10 @@ def test_runtime_rejects_dataclass_replacement_of_trusted_source(services, works
 
 
 def test_authorized_source_capability_cannot_be_constructed_copied_or_pickled(
-    services, workspace, source
+    services, config, workspace, source
 ):
-    compiled = DuckDBCompiler(services.repository).compile(
+    runtime = DuckDBRuntime(config)
+    compiled = runtime.compiler(services.repository).compile(
         "tenant-a",
         workspace.id,
         AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
@@ -631,7 +762,7 @@ def test_authorized_source_capability_cannot_be_constructed_copied_or_pickled(
         AuthorizedSource(source.id, "source_0", source.path)
     forged = object.__new__(AuthorizedSource)
     with (
-        pytest.raises(ValueError, match="authorized by the compiler"),
+        pytest.raises(ValueError, match="authorized by this runtime"),
         DuckDBRuntime(
             config=AppConfig(
                 master_key=b"test-master-key-material-32-bytes!",
@@ -648,8 +779,77 @@ def test_authorized_source_capability_cannot_be_constructed_copied_or_pickled(
         pickle.dumps(trusted)
 
 
+def test_compiler_module_exposes_no_source_mint_or_metadata_resolver():
+    assert not hasattr(compiler_module, "_mint_source")
+    assert not hasattr(compiler_module, "authorized_source_metadata")
+
+
+def test_runtime_owns_compiler_capabilities_and_consumes_them_once(
+    services, config, workspace, source
+):
+    runtime = DuckDBRuntime(config)
+    assert callable(getattr(runtime, "compiler", None))
+    assert not hasattr(runtime, "_DuckDBRuntime__authorize")
+    assert not hasattr(runtime, "_DuckDBRuntime__consume")
+    compiled = runtime.compiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
+    )
+    with runtime.connection(compiled.sources) as connection:
+        assert connection.execute(compiled.sql, compiled.parameters).fetchall()
+    with (
+        pytest.raises(ValueError, match="authorized by this runtime"),
+        runtime.connection(compiled.sources),
+    ):
+        pass
+
+
+def test_source_capability_cannot_cross_runtime_instances(services, config, workspace, source):
+    issuer = DuckDBRuntime(config)
+    assert callable(getattr(issuer, "compiler", None))
+    compiled = issuer.compiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
+    )
+    with (
+        pytest.raises(ValueError, match="authorized by this runtime"),
+        DuckDBRuntime(config).connection(compiled.sources),
+    ):
+        pass
+
+
+def test_known_token_clone_and_mutated_legitimate_capability_are_rejected(
+    services, config, workspace, source
+):
+    runtime = DuckDBRuntime(config)
+    compiled = runtime.compiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
+    )
+    trusted = compiled.sources[0]
+    clone = object.__new__(AuthorizedSource)
+    object.__setattr__(clone, "_relation_name", trusted.relation_name)
+    object.__setattr__(clone, "_token", object.__getattribute__(trusted, "_token"))
+    with (
+        pytest.raises(ValueError, match="authorized by this runtime"),
+        runtime.connection((clone,)),
+    ):
+        pass
+
+    object.__setattr__(trusted, "_relation_name", "tampered")
+    with (
+        pytest.raises(ValueError, match="authorized by this runtime"),
+        runtime.connection(compiled.sources),
+    ):
+        pass
+
+
 def test_runtime_rejects_source_replaced_after_compile(services, config, workspace, source):
-    compiled = DuckDBCompiler(services.repository).compile(
+    runtime = DuckDBRuntime(config)
+    compiled = runtime.compiler(services.repository).compile(
         "tenant-a",
         workspace.id,
         AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
@@ -661,13 +861,14 @@ def test_runtime_rejects_source_replaced_after_compile(services, config, workspa
     os.replace(replacement, source.path)
     with (
         pytest.raises(SecurityPolicyViolation, match="changed after compilation"),
-        DuckDBRuntime(config).connection(compiled.sources),
+        runtime.connection(compiled.sources),
     ):
         pass
 
 
 def test_registered_source_keeps_stable_file_identity(services, config, workspace, source):
-    compiled = DuckDBCompiler(services.repository).compile(
+    runtime = DuckDBRuntime(config)
+    compiled = runtime.compiler(services.repository).compile(
         "tenant-a",
         workspace.id,
         AnalysisPlan(
@@ -679,9 +880,38 @@ def test_registered_source_keeps_stable_file_identity(services, config, workspac
     pd.DataFrame(
         {"group": ["evil"], "value": [999.0], "text": ["evil"], "flag": [False]}
     ).to_parquet(replacement, index=False)
-    with DuckDBRuntime(config).connection(compiled.sources) as connection:
+    with runtime.connection(compiled.sources) as connection:
         with suppress(PermissionError):
             os.replace(replacement, source.path)
+        assert connection.execute(compiled.sql, compiled.parameters).fetchall() == [
+            ("a",),
+            ("a",),
+            ("b",),
+            ("b",),
+        ]
+
+
+def test_runtime_snapshot_ignores_same_inode_overwrite_after_connection_yields(
+    services, config, workspace, source
+):
+    runtime = DuckDBRuntime(config)
+    compiled = runtime.compiler(services.repository).compile(
+        "tenant-a",
+        workspace.id,
+        AnalysisPlan(
+            input_artifact_id=source.id,
+            operations=[{"action": "select", "columns": ["group"]}],
+        ),
+    )
+    replacement = source.path.with_name("same-inode-overwrite.parquet")
+    pd.DataFrame(
+        {"group": ["evil"], "value": [999.0], "text": ["evil"], "flag": [False]}
+    ).to_parquet(replacement, index=False)
+    with runtime.connection(compiled.sources) as connection:
+        with source.path.open("r+b") as destination, replacement.open("rb") as attacker:
+            destination.seek(0)
+            shutil.copyfileobj(attacker, destination)
+            destination.truncate()
         assert connection.execute(compiled.sql, compiled.parameters).fetchall() == [
             ("a",),
             ("a",),
@@ -701,15 +931,16 @@ def test_registered_source_keeps_stable_file_identity(services, config, workspac
 def test_runtime_rejects_direct_config_values_above_resource_caps(
     field, value, services, config, workspace, source
 ):
-    compiled = DuckDBCompiler(services.repository).compile(
+    unsafe = replace(config, **{field: value})
+    runtime = DuckDBRuntime(unsafe)
+    compiled = runtime.compiler(services.repository).compile(
         "tenant-a",
         workspace.id,
         AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
     )
-    unsafe = replace(config, **{field: value})
     with (
         pytest.raises(ConfigurationError),
-        DuckDBRuntime(unsafe).connection(compiled.sources),
+        runtime.connection(compiled.sources),
     ):
         pass
 
@@ -724,16 +955,15 @@ def test_runtime_rejects_resolved_temp_directory_outside_data_dir(
         def __truediv__(self, _child):
             return tmp_path / "outside" / "duckdb-temp"
 
-    compiled = DuckDBCompiler(services.repository).compile(
+    runtime = DuckDBRuntime(replace(config, data_dir=EscapingDataDirectory()))
+    compiled = runtime.compiler(services.repository).compile(
         "tenant-a",
         workspace.id,
         AnalysisPlan(input_artifact_id=source.id, operations=[{"action": "head", "rows": 1}]),
     )
     with (
         pytest.raises(ConfigurationError, match="temp directory"),
-        DuckDBRuntime(replace(config, data_dir=EscapingDataDirectory())).connection(
-            compiled.sources
-        ),
+        runtime.connection(compiled.sources),
     ):
         pass
 

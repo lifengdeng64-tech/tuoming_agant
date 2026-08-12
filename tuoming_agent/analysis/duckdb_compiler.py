@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import ast
-import hashlib
-import os
-import weakref
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from tuoming_agent.analysis.errors import SecurityPolicyViolation
 from tuoming_agent.analysis.models import (
@@ -33,24 +29,10 @@ PRIMARY_ARTIFACT_LIMIT = 200 * MIB
 SECONDARY_ARTIFACT_LIMIT = 50 * MIB
 
 
-@dataclass(frozen=True)
-class _AuthorizedSourceMetadata:
-    artifact_id: str
-    relation_name: str
-    path: Path
-    role: str
-    size_limit: int
-    device: int
-    inode: int
-    size: int
-    modified_ns: int
-    sha256: str
-
-
 class AuthorizedSource:
-    """Opaque source capability minted only after repository authorization."""
+    """Opaque, runtime-owned source capability."""
 
-    __slots__ = ("_relation_name", "__weakref__")
+    __slots__ = ("_relation_name", "_token")
 
     def __new__(cls, *_args: Any, **_kwargs: Any) -> AuthorizedSource:
         raise TypeError("AuthorizedSource capabilities are minted by DuckDBCompiler.")
@@ -66,26 +48,16 @@ class AuthorizedSource:
         raise TypeError("AuthorizedSource capabilities cannot be serialized.")
 
 
-def _source_capabilities() -> tuple[Any, Any]:
-    registry: weakref.WeakKeyDictionary[AuthorizedSource, _AuthorizedSourceMetadata]
-    registry = weakref.WeakKeyDictionary()
-
-    def mint(metadata: _AuthorizedSourceMetadata) -> AuthorizedSource:
-        source = object.__new__(AuthorizedSource)
-        object.__setattr__(source, "_relation_name", metadata.relation_name)
-        registry[source] = metadata
-        return source
-
-    def resolve(source: AuthorizedSource) -> _AuthorizedSourceMetadata | None:
-        metadata = registry.get(source)
-        if metadata is None or source.relation_name != metadata.relation_name:
-            return None
-        return metadata
-
-    return mint, resolve
-
-
-_mint_source, authorized_source_metadata = _source_capabilities()
+class SourceAuthorizer(Protocol):
+    def __call__(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        artifact_id: str,
+        relation_name: str,
+        role: str,
+        size_limit: int,
+    ) -> AuthorizedSource: ...
 
 
 @dataclass(frozen=True)
@@ -101,14 +73,16 @@ class _QueryState:
     sql: str
     columns: list[str]
     lineage: dict[str, ColumnLineage]
+    dtypes: dict[str, str]
     order_column: str
 
 
 class DuckDBCompiler:
     """Compile the structured analysis allowlist without accepting SQL or paths."""
 
-    def __init__(self, repository: Repository):
+    def __init__(self, repository: Repository, source_authorizer: SourceAuthorizer):
         self.repository = repository
+        self.__source_authorizer = source_authorizer
         self._parameters: list[Any] = []
         self._sources: list[AuthorizedSource] = []
 
@@ -122,9 +96,15 @@ class DuckDBCompiler:
             limit=PRIMARY_ARTIFACT_LIMIT,
             role="primary",
         )
-        columns = self._schema_columns(primary)
+        columns, dtypes = self._schema(primary)
         order_column = self._internal_order_column(columns)
-        source = self._authorize_source(primary, role="primary", size_limit=PRIMARY_ARTIFACT_LIMIT)
+        source = self._authorize_source(
+            tenant_id,
+            workspace_id,
+            primary,
+            role="primary",
+            size_limit=PRIMARY_ARTIFACT_LIMIT,
+        )
         state = _QueryState(
             sql=(
                 f"SELECT {self._column_list(columns)}, "
@@ -133,6 +113,7 @@ class DuckDBCompiler:
             ),
             columns=columns,
             lineage=dict(primary.lineage),
+            dtypes=dtypes,
             order_column=order_column,
         )
 
@@ -161,6 +142,7 @@ class DuckDBCompiler:
                 self._select_stage(state, columns),
                 columns,
                 {name: state.lineage[name] for name in columns if name in state.lineage},
+                {name: state.dtypes[name] for name in columns},
             )
         if isinstance(operation, FilterOperation):
             return self._filter(state, operation)
@@ -266,11 +248,15 @@ class DuckDBCompiler:
         lineage = {
             operation.mapping.get(name, name): value for name, value in state.lineage.items()
         }
+        dtypes = {
+            operation.mapping.get(name, name): value for name, value in state.dtypes.items()
+        }
         sql = f"SELECT {', '.join(projections)} FROM ({state.sql}) AS {self._quote('_rename')}"
         return _QueryState(
             sql=sql,
             columns=columns,
             lineage=lineage,
+            dtypes=dtypes,
             order_column=order_column,
         )
 
@@ -283,20 +269,30 @@ class DuckDBCompiler:
             "boolean": "BOOLEAN",
             "datetime": "TIMESTAMP",
         }
-        projections = [
-            (
-                f"CAST(trunc({self._quote(name)}) AS BIGINT) AS {self._quote(name)}"
-                if operation.mapping.get(name) == "int64"
-                else f"CAST({self._quote(name)} AS {types[operation.mapping[name]]}) "
-                f"AS {self._quote(name)}"
-                if name in operation.mapping
-                else self._quote(name)
-            )
-            for name in state.columns
-        ]
+        projections = []
+        for name in state.columns:
+            target = operation.mapping.get(name)
+            if target == "int64":
+                source = self._quote(name)
+                converted = (
+                    f"trunc({source})" if self._is_numeric_dtype(state.dtypes[name]) else source
+                )
+                projections.append(
+                    f"CASE WHEN {source} IS NULL THEN "
+                    f"error('Cannot convert null to int64') ELSE "
+                    f"CAST({converted} AS BIGINT) END AS {source}"
+                )
+            elif target is not None:
+                projections.append(
+                    f"CAST({self._quote(name)} AS {types[target]}) AS {self._quote(name)}"
+                )
+            else:
+                projections.append(self._quote(name))
         projections.append(self._quote(state.order_column))
         sql = f"SELECT {', '.join(projections)} FROM ({state.sql}) AS {self._quote('_cast')}"
-        return self._state(state, sql)
+        dtypes = dict(state.dtypes)
+        dtypes.update(operation.mapping)
+        return self._state(state, sql, dtypes=dtypes)
 
     def _fillna(self, state: _QueryState, operation: FillnaOperation) -> _QueryState:
         self._require_columns(state.columns, list(operation.values))
@@ -358,10 +354,14 @@ class DuckDBCompiler:
             limit=SECONDARY_ARTIFACT_LIMIT,
             role="secondary",
         )
-        right_columns = self._schema_columns(artifact)
+        right_columns, right_dtypes = self._schema(artifact)
         self._require_columns(right_columns, operation.right_on)
         source = self._authorize_source(
-            artifact, role="secondary", size_limit=SECONDARY_ARTIFACT_LIMIT
+            tenant_id,
+            workspace_id,
+            artifact,
+            role="secondary",
+            size_limit=SECONDARY_ARTIFACT_LIMIT,
         )
 
         overlap = (set(state.columns) & set(right_columns)) - set(operation.left_on)
@@ -421,10 +421,16 @@ class DuckDBCompiler:
             columns,
             operation,
         )
+        dtypes = {
+            output: state.dtypes[source]
+            for source, output in zip(state.columns, left_names, strict=True)
+        }
+        dtypes.update({output: right_dtypes[source] for source, output in right_entries})
         return _QueryState(
             sql=sql,
             columns=columns,
             lineage=lineage,
+            dtypes=dtypes,
             order_column=order_column,
         )
 
@@ -468,16 +474,27 @@ class DuckDBCompiler:
             f"ORDER BY {group_columns}"
         )
         lineage = {name: state.lineage[name] for name in operation.by if name in state.lineage}
+        dtypes = {name: state.dtypes[name] for name in operation.by}
+        for item in operation.aggregations:
+            if item.function in {"count", "nunique"}:
+                dtypes[item.output] = "int64"
+            elif item.function in {"mean", "median"}:
+                dtypes[item.output] = "float64"
+            else:
+                dtypes[item.output] = state.dtypes[item.column]
         return _QueryState(
             sql=sql,
             columns=columns,
             lineage=lineage,
+            dtypes=dtypes,
             order_column=order_column,
         )
 
     def _derive(self, state: _QueryState, operation: DeriveOperation) -> _QueryState:
         prior_parameter_count = len(self._parameters)
-        expression = self._compile_expression(state.columns, operation.expression)
+        expression, expression_dtype = self._compile_expression(
+            state.columns, state.dtypes, operation.expression
+        )
         self._move_new_parameters_before(prior_parameter_count)
         if operation.column in state.columns:
             columns = list(state.columns)
@@ -500,10 +517,13 @@ class DuckDBCompiler:
         sql = f"SELECT {', '.join(projections)} FROM ({state.sql}) AS {self._quote('_derive')}"
         lineage = dict(state.lineage)
         lineage.pop(operation.column, None)
+        dtypes = dict(state.dtypes)
+        dtypes[operation.column] = expression_dtype
         return _QueryState(
             sql=sql,
             columns=columns,
             lineage=lineage,
+            dtypes=dtypes,
             order_column=order_column,
         )
 
@@ -522,7 +542,9 @@ class DuckDBCompiler:
             )
         return self._state(state, sql)
 
-    def _compile_expression(self, columns: list[str], expression: str) -> str:
+    def _compile_expression(
+        self, columns: list[str], dtypes: dict[str, str], expression: str
+    ) -> tuple[str, str]:
         try:
             tree = ast.parse(expression, mode="eval")
         except SyntaxError as exc:
@@ -535,31 +557,108 @@ class DuckDBCompiler:
             ast.Div: "/",
         }
 
-        def compile_node(node: ast.AST) -> str:
+        def infer_dtype(node: ast.AST) -> str:
             if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
-                return self._bind(node.value)
+                return "int64" if isinstance(node.value, int) else "float64"
             if isinstance(node, ast.Name):
                 self._require_columns(columns, [node.id])
-                return self._quote(node.id)
-            if isinstance(node, ast.BinOp) and type(node.op) in binary:
-                left = compile_node(node.left)
-                right = compile_node(node.right)
-                return f"({left} {binary[type(node.op)]} {right})"
-            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.FloorDiv):
-                return f"floor({compile_node(node.left)} / {compile_node(node.right)})"
-            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
-                dividend = compile_node(node.left)
-                quotient_dividend = compile_node(node.left)
-                quotient_divisor = compile_node(node.right)
-                multiplier = compile_node(node.right)
+                return dtypes[node.id]
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd | ast.USub):
+                return infer_dtype(node.operand)
+            if isinstance(node, ast.BinOp):
+                left_dtype = infer_dtype(node.left)
+                right_dtype = infer_dtype(node.right)
+                if isinstance(node.op, ast.Div | ast.Pow):
+                    return "float64"
                 return (
-                    f"({dividend} - floor({quotient_dividend} / {quotient_divisor}) * {multiplier})"
+                    "int64"
+                    if self._is_integer_dtype(left_dtype)
+                    and self._is_integer_dtype(right_dtype)
+                    else "float64"
+                )
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "col"
+                and len(node.args) == 1
+                and not node.keywords
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                name = node.args[0].value
+                self._require_columns(columns, [name])
+                return dtypes[name]
+            raise SecurityPolicyViolation(
+                "Only numeric constants, arithmetic operators and col('column') are allowed."
+            )
+
+        def compile_node(node: ast.AST) -> tuple[str, str]:
+            if isinstance(node, ast.Constant) and isinstance(node.value, int | float):
+                dtype = "int64" if isinstance(node.value, int) else "float64"
+                return self._bind(node.value), dtype
+            if isinstance(node, ast.Name):
+                self._require_columns(columns, [node.id])
+                return self._quote(node.id), dtypes[node.id]
+            if isinstance(node, ast.BinOp) and type(node.op) in binary:
+                left, left_dtype = compile_node(node.left)
+                right, right_dtype = compile_node(node.right)
+                dtype = (
+                    "float64"
+                    if isinstance(node.op, ast.Div)
+                    or not self._is_integer_dtype(left_dtype)
+                    or not self._is_integer_dtype(right_dtype)
+                    else "int64"
+                )
+                return f"({left} {binary[type(node.op)]} {right})", dtype
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.FloorDiv):
+                left_dtype = infer_dtype(node.left)
+                right_dtype = infer_dtype(node.right)
+                if self._is_literal_zero(node.right):
+                    left, _ = compile_node(node.left)
+                    right, _ = compile_node(node.right)
+                    return f"floor(CAST({left} AS DOUBLE) / CAST({right} AS DOUBLE))", "float64"
+                if self._is_integer_dtype(left_dtype) and self._is_integer_dtype(right_dtype):
+                    quotient = self._integer_floor_quotient(
+                        node.left, node.right, compile_node
+                    )
+                    return quotient, "int64"
+                left, _ = compile_node(node.left)
+                right, _ = compile_node(node.right)
+                return f"floor({left} / {right})", "float64"
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+                if self._is_literal_zero(node.right):
+                    return "CAST('NaN' AS DOUBLE)", "float64"
+                dividend_dtype = infer_dtype(node.left)
+                divisor_dtype = infer_dtype(node.right)
+                dividend, _ = compile_node(node.left)
+                if self._is_integer_dtype(dividend_dtype) and self._is_integer_dtype(
+                    divisor_dtype
+                ):
+                    quotient = self._integer_floor_quotient(
+                        node.left, node.right, compile_node
+                    )
+                    multiplier, _ = compile_node(node.right)
+                    return (
+                        f"CAST(CAST({dividend} AS HUGEINT) - ({quotient}) * "
+                        f"CAST({multiplier} AS HUGEINT) AS BIGINT)",
+                        "int64",
+                    )
+                quotient_dividend, _ = compile_node(node.left)
+                quotient_divisor, _ = compile_node(node.right)
+                multiplier, _ = compile_node(node.right)
+                return (
+                    f"({dividend} - floor({quotient_dividend} / {quotient_divisor}) * "
+                    f"{multiplier})",
+                    "float64",
                 )
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
-                return f"power({compile_node(node.left)}, {compile_node(node.right)})"
+                left, _ = compile_node(node.left)
+                right, _ = compile_node(node.right)
+                return f"power({left}, {right})", "float64"
             if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd | ast.USub):
                 operator = "+" if isinstance(node.op, ast.UAdd) else "-"
-                return f"({operator}{compile_node(node.operand)})"
+                operand, dtype = compile_node(node.operand)
+                return f"({operator}{operand})", dtype
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -570,12 +669,34 @@ class DuckDBCompiler:
                 and isinstance(node.args[0].value, str)
             ):
                 self._require_columns(columns, [node.args[0].value])
-                return self._quote(node.args[0].value)
+                name = node.args[0].value
+                return self._quote(name), dtypes[name]
             raise SecurityPolicyViolation(
                 "Only numeric constants, arithmetic operators and col('column') are allowed."
             )
 
         return compile_node(tree.body)
+
+    def _integer_floor_quotient(
+        self, left_node: ast.AST, right_node: ast.AST, compile_node: Any
+    ) -> str:
+        left, _ = compile_node(left_node)
+        right, _ = compile_node(right_node)
+        remainder_left, _ = compile_node(left_node)
+        remainder_right, _ = compile_node(right_node)
+        sign_left, _ = compile_node(left_node)
+        sign_right, _ = compile_node(right_node)
+        return (
+            f"CAST((CAST({left} AS HUGEINT) // CAST({right} AS HUGEINT)) - "
+            f"CASE WHEN (CAST({remainder_left} AS HUGEINT) % "
+            f"CAST({remainder_right} AS HUGEINT)) <> 0 AND "
+            f"((CAST({sign_left} AS HUGEINT) < 0) <> "
+            f"(CAST({sign_right} AS HUGEINT) < 0)) THEN 1 ELSE 0 END AS BIGINT)"
+        )
+
+    @staticmethod
+    def _is_literal_zero(node: ast.AST) -> bool:
+        return isinstance(node, ast.Constant) and node.value == 0
 
     def _resolve_source(
         self,
@@ -597,51 +718,56 @@ class DuckDBCompiler:
         return artifact
 
     def _authorize_source(
-        self, artifact: ArtifactRecord, *, role: str, size_limit: int
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        artifact: ArtifactRecord,
+        *,
+        role: str,
+        size_limit: int,
     ) -> AuthorizedSource:
-        path = artifact.path.resolve(strict=True)
-        fingerprint = self._fingerprint(path)
         relation_name = f"source_{len(self._sources)}"
-        source = _mint_source(
-            _AuthorizedSourceMetadata(
-                artifact_id=artifact.id,
-                relation_name=relation_name,
-                path=path,
-                role=role,
-                size_limit=size_limit,
-                device=fingerprint.st_dev,
-                inode=fingerprint.st_ino,
-                size=fingerprint.st_size,
-                modified_ns=fingerprint.st_mtime_ns,
-                sha256=self._sha256(path),
-            ),
+        source = self.__source_authorizer(
+            tenant_id,
+            workspace_id,
+            artifact.id,
+            relation_name,
+            role,
+            size_limit,
         )
         self._sources.append(source)
         return source
 
     @staticmethod
-    def _fingerprint(path: Path) -> os.stat_result:
-        return path.stat()
-
-    @staticmethod
-    def _sha256(path: Path) -> str:
-        with path.open("rb") as stream:
-            return hashlib.file_digest(stream, "sha256").hexdigest()
-
-    @staticmethod
-    def _schema_columns(artifact: ArtifactRecord) -> list[str]:
+    def _schema(artifact: ArtifactRecord) -> tuple[list[str], dict[str, str]]:
         raw_columns = artifact.schema.get("columns")
         if not isinstance(raw_columns, list):
             raise ValueError("Artifact schema has no column metadata.")
         columns: list[str] = []
+        dtypes: dict[str, str] = {}
         for item in raw_columns:
             if not isinstance(item, dict) or not isinstance(item.get("name"), str):
                 raise ValueError("Artifact schema contains an invalid column.")
-            columns.append(item["name"])
+            name = item["name"]
+            dtype = item.get("dtype")
+            if not isinstance(dtype, str):
+                raise ValueError("Artifact schema contains an invalid dtype.")
+            columns.append(name)
+            dtypes[name] = dtype
         if not columns:
             raise ValueError("Artifact schema has no columns.")
         DuckDBCompiler._require_unique_output(columns)
-        return columns
+        return columns, dtypes
+
+    @staticmethod
+    def _is_integer_dtype(dtype: str) -> bool:
+        normalized = dtype.lower()
+        return normalized.startswith(("int", "uint"))
+
+    @classmethod
+    def _is_numeric_dtype(cls, dtype: str) -> bool:
+        normalized = dtype.lower()
+        return cls._is_integer_dtype(dtype) or normalized.startswith(("float", "decimal"))
 
     @staticmethod
     def _require_columns(available: list[str], requested: list[str]) -> None:
@@ -696,11 +822,13 @@ class DuckDBCompiler:
         sql: str,
         columns: list[str] | None = None,
         lineage: dict[str, ColumnLineage] | None = None,
+        dtypes: dict[str, str] | None = None,
     ) -> _QueryState:
         return _QueryState(
             sql=sql,
             columns=previous.columns if columns is None else columns,
             lineage=previous.lineage if lineage is None else lineage,
+            dtypes=previous.dtypes if dtypes is None else dtypes,
             order_column=previous.order_column,
         )
 
