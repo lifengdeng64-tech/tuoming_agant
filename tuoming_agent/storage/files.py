@@ -28,7 +28,9 @@ class SecureFileStore:
         self.master_key = master_key
 
     def write(self, tenant_id: str, workspace_id: str, content_hash: str, content: bytes) -> Path:
-        path, actual_hash, _ = self.write_stream(tenant_id, workspace_id, BytesIO(content))
+        path, actual_hash, _, _ = self.write_stream(
+            tenant_id, workspace_id, BytesIO(content)
+        )
         if actual_hash != content_hash:
             raise ValueError("content_hash does not match content.")
         return path
@@ -39,7 +41,7 @@ class SecureFileStore:
         workspace_id: str,
         source: BinaryIO,
         chunk_size: int = 1024 * 1024,
-    ) -> tuple[Path, str, int]:
+    ) -> tuple[Path, str, int, bool]:
         target_dir = self.root / "uploads" / tenant_id / workspace_id
         target_dir.mkdir(parents=True, exist_ok=True)
         key = derive_key(self.master_key, "upload", tenant_id)
@@ -51,13 +53,15 @@ class SecureFileStore:
                     key, source, encrypted, aad, chunk_size
                 )
             target = target_dir / f"{content_hash}.enc"
+            created = False
             try:
                 os.link(temporary, target)
+                created = True
             except FileExistsError:
                 pass
             finally:
                 temporary.unlink(missing_ok=True)
-            return target, content_hash, byte_size
+            return target, content_hash, byte_size, created
         except Exception:
             temporary.unlink(missing_ok=True)
             raise

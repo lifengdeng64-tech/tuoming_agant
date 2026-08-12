@@ -120,18 +120,24 @@ def _detect_csv_encoding(source: BinaryIO, sample_size: int = 64 * 1024) -> str:
 
 
 def _normalize_excel_headers(header: tuple[object, ...]) -> list[str]:
+    bases = [
+        f"Unnamed: {index}" if value is None or str(value) == "" else str(value)
+        for index, value in enumerate(header)
+    ]
     columns: list[str] = []
-    counts: dict[str, int] = {}
+    used: set[str] = set()
     for index, value in enumerate(header):
-        base = f"Unnamed: {index}" if value is None or str(value) == "" else str(value)
-        occurrence = counts.get(base, 0)
-        candidate = base if occurrence == 0 else f"{base}.{occurrence}"
-        while candidate in counts:
-            occurrence += 1
-            candidate = f"{base}.{occurrence}"
-        counts[base] = occurrence + 1
-        counts[candidate] = 1
+        base = bases[index]
+        candidate = base
+        if candidate in used or (value is None and candidate in bases[index + 1 :]):
+            suffix = 1
+            candidate = f"{base}.{suffix}"
+            reserved = set(bases[index + 1 :])
+            while candidate in used or candidate in reserved:
+                suffix += 1
+                candidate = f"{base}.{suffix}"
         columns.append(candidate)
+        used.add(candidate)
     return columns
 
 
@@ -141,14 +147,28 @@ def _read_excel(
     try:
         source = BytesIO(content) if isinstance(content, bytes) else content
         source.seek(0)
-        workbook = pd.ExcelFile(source, engine="openpyxl")
-        return [
-            ParsedTable(
-                logical_name=f"{stem}::{sheet_name}",
-                sheet_name=sheet_name,
-                dataframe=workbook.parse(sheet_name, nrows=sample_rows),
-            )
-            for sheet_name in workbook.sheet_names
-        ]
+        workbook = openpyxl.load_workbook(
+            source, read_only=True, data_only=True, keep_vba=False
+        )
+        try:
+            tables: list[ParsedTable] = []
+            for worksheet in workbook.worksheets:
+                rows = worksheet.iter_rows(values_only=True)
+                header = next(rows, None)
+                if header is None:
+                    continue
+                dataframe = pd.DataFrame(
+                    list(islice(rows, sample_rows)), columns=_normalize_excel_headers(header)
+                )
+                tables.append(
+                    ParsedTable(
+                        logical_name=f"{stem}::{worksheet.title}",
+                        sheet_name=worksheet.title,
+                        dataframe=dataframe,
+                    )
+                )
+            return tables
+        finally:
+            workbook.close()
     except Exception as exc:
         raise UnsupportedFileError("Excel workbook could not be parsed.") from exc

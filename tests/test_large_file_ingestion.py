@@ -17,6 +17,7 @@ from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import iter_file_chunks, preview_file
 from tuoming_agent.ingestion.service import UnsafeIngestionError
 from tuoming_agent.security.crypto import STREAM_MAGIC, derive_key
+from tuoming_agent.security.masking import ColumnPolicy
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
 from tuoming_agent.ui import app as ui_app
 
@@ -164,12 +165,13 @@ def test_secure_file_store_streams_encryption_and_reads_legacy_files(tmp_path: P
     store = SecureFileStore(tmp_path, b"test-master-key-material-32-bytes!")
     content = (b"streaming-content-" * 1000) + b"end"
 
-    path, content_hash, byte_size = store.write_stream(
+    path, content_hash, byte_size, created = store.write_stream(
         "tenant-a", "workspace-a", BoundedReadStream(content), chunk_size=257
     )
 
     assert content_hash == hashlib.sha256(content).hexdigest()
     assert byte_size == len(content)
+    assert created is True
     assert store.read("tenant-a", "workspace-a", content_hash, path) == content
 
     legacy_hash = hashlib.sha256(b"legacy").hexdigest()
@@ -183,7 +185,7 @@ def test_secure_file_store_streams_encryption_and_reads_legacy_files(tmp_path: P
 
 def test_secure_stream_rejects_tampering_and_truncation(tmp_path: Path) -> None:
     store = SecureFileStore(tmp_path, b"test-master-key-material-32-bytes!")
-    path, content_hash, _ = store.write_stream(
+    path, content_hash, _, _ = store.write_stream(
         "tenant-a", "workspace-a", BytesIO(b"authenticated payload"), chunk_size=7
     )
     original = path.read_bytes()
@@ -275,6 +277,56 @@ def test_excel_parser_makes_blank_and_duplicate_headers_unique() -> None:
     assert chunks[0].dataframe.loc[1, "value.1"] == "late@example.com"
 
 
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        (("a", "a", "a.1"), ["a", "a.2", "a.1"]),
+        ((None, "Unnamed: 0"), ["Unnamed: 0.1", "Unnamed: 0"]),
+    ],
+)
+def test_excel_preview_and_ingestion_share_collision_safe_headers(headers, expected) -> None:
+    source = BytesIO()
+    with pd.ExcelWriter(source, engine="xlsxwriter") as writer:
+        worksheet = writer.book.add_worksheet("Headers")
+        writer.sheets["Headers"] = worksheet
+        worksheet.write_row(0, 0, list(headers))
+        worksheet.write_row(1, 0, ["safe"] * len(headers))
+    content = source.getvalue()
+
+    preview = preview_file("book.xlsx", BytesIO(content))[0]
+    ingested = list(iter_file_chunks("book.xlsx", BytesIO(content)))[0]
+
+    assert preview.dataframe.columns.tolist() == expected
+    assert ingested.dataframe.columns.tolist() == expected
+
+
+def test_excel_preview_policy_name_masks_same_sensitive_column_during_ingestion(
+    services, workspace
+) -> None:
+    source = BytesIO()
+    with pd.ExcelWriter(source, engine="xlsxwriter") as writer:
+        worksheet = writer.book.add_worksheet("Headers")
+        writer.sheets["Headers"] = worksheet
+        worksheet.write_row(0, 0, ["a", "a", "a.1"])
+        worksheet.write_row(1, 0, ["safe", "safe", "late@example.com"])
+    content = source.getvalue()
+    logical_name = "book::Headers"
+    preview = preview_file("book.xlsx", BytesIO(content))[0]
+    sensitive_column = preview.dataframe.columns[2]
+
+    result = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "book.xlsx",
+        content,
+        {logical_name: {sensitive_column: ColumnPolicy("email")}},
+    )
+
+    masked = services.ingestion.artifact_store.read_dataframe(result.artifacts[0].path)
+    assert sensitive_column == "a.1"
+    assert masked.loc[0, sensitive_column].startswith("EMAIL_V1_")
+
+
 def test_artifact_store_writes_multiple_chunks_with_one_schema(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path)
     chunks = [
@@ -358,7 +410,7 @@ def test_source_mutation_removes_new_encrypted_orphan(monkeypatch, services, wor
 
     def mismatched_stream_write(*args, **kwargs):
         orphan.write_bytes(b"orphan")
-        return orphan, "f" * 64, 999
+        return orphan, "f" * 64, 999, True
 
     monkeypatch.setattr(
         services.ingestion.secure_file_store, "write_stream", mismatched_stream_write
@@ -373,12 +425,47 @@ def test_source_mutation_removes_new_encrypted_orphan(monkeypatch, services, wor
     assert not orphan.exists()
 
 
+def test_mutation_to_preexisting_original_never_deletes_winner(
+    monkeypatch, services, workspace
+) -> None:
+    winner_content = pd.DataFrame({"value": [1]}).to_csv(index=False).encode()
+    winner = services.ingestion.ingest(
+        "tenant-a", workspace.id, "winner.csv", winner_content, {"winner": {}}
+    )
+    file_record = services.repository.find_file_by_hash(
+        "tenant-a", workspace.id, winner.content_hash
+    )
+    winner_path = Path(file_record["encrypted_path"])
+    original_write_stream = services.ingestion.secure_file_store.write_stream
+
+    def changed_to_existing(*args, **kwargs):
+        path, content_hash, byte_size, _created = original_write_stream(*args, **kwargs)
+        return winner_path, winner.content_hash, byte_size, False
+
+    monkeypatch.setattr(
+        services.ingestion.secure_file_store, "write_stream", changed_to_existing
+    )
+    different = pd.DataFrame({"value": [2]}).to_csv(index=False).encode()
+
+    with pytest.raises(ValueError, match="changed"):
+        services.ingestion.ingest(
+            "tenant-a", workspace.id, "changed.csv", different, {"changed": {}}
+        )
+
+    assert services.ingestion.secure_file_store.read(
+        "tenant-a", workspace.id, winner.content_hash, winner_path
+    ) == winner_content
+
+
 def test_duplicate_race_cleans_loser_files_and_returns_existing_result(
     monkeypatch, services, workspace
 ) -> None:
     content = pd.DataFrame({"value": [1]}).to_csv(index=False).encode()
     first = services.ingestion.ingest(
         "tenant-a", workspace.id, "race.csv", content, {"race": {}}
+    )
+    file_record = services.repository.find_file_by_hash(
+        "tenant-a", workspace.id, first.content_hash
     )
     monkeypatch.setattr(services.repository, "find_file_by_hash", lambda *args: None)
 
@@ -390,6 +477,9 @@ def test_duplicate_race_cleans_loser_files_and_returns_existing_result(
     assert duplicate.file_id == first.file_id
     assert duplicate.artifacts == first.artifacts
     assert len(list((services.ingestion.artifact_store.root / "artifacts").rglob("*.parquet"))) == 1
+    assert services.ingestion.secure_file_store.read(
+        "tenant-a", workspace.id, first.content_hash, file_record["encrypted_path"]
+    ) == content
 
 
 def test_concurrent_duplicate_ingestions_publish_one_complete_version(

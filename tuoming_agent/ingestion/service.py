@@ -87,6 +87,7 @@ class IngestionService:
         pending: list[tuple[ArtifactRecord, str | None, dict[str, ColumnPolicy]]] = []
         created_paths: list[Path] = []
         encrypted_path: Path | None = None
+        encrypted_created = False
         source.seek(0)
         try:
             chunks = iter_file_chunks(filename, source)
@@ -144,15 +145,18 @@ class IngestionService:
                 )
 
             source.seek(0)
-            encrypted_path, streamed_hash, streamed_size = self.secure_file_store.write_stream(
-                tenant_id, workspace_id, source
-            )
+            (
+                encrypted_path,
+                streamed_hash,
+                streamed_size,
+                encrypted_created,
+            ) = self.secure_file_store.write_stream(tenant_id, workspace_id, source)
             if streamed_hash != content_hash or streamed_size != byte_size:
                 raise ValueError("Upload changed while it was being ingested.")
         except Exception:
             for path in created_paths:
                 path.unlink(missing_ok=True)
-            if encrypted_path is not None:
+            if encrypted_path is not None and encrypted_created:
                 encrypted_path.unlink(missing_ok=True)
             raise
 
@@ -184,7 +188,10 @@ class IngestionService:
         except Exception:
             for path in created_paths:
                 path.unlink(missing_ok=True)
-            encrypted_path.unlink(missing_ok=True)
+            if encrypted_created and not self.repository.find_file_by_hash(
+                tenant_id, workspace_id, content_hash
+            ):
+                encrypted_path.unlink(missing_ok=True)
             raise
         if lost_race:
             for path in created_paths:
