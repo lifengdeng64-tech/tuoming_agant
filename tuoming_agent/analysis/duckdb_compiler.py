@@ -277,10 +277,19 @@ class DuckDBCompiler:
                 converted = (
                     f"trunc({source})" if self._is_numeric_dtype(state.dtypes[name]) else source
                 )
+                requires_integer_text = self._requires_integer_text(state.dtypes[name])
+                invalid_text = (
+                    f"NOT regexp_full_match({source}, "
+                    "'^[[:space:]]*[+-]?[0-9](?:_?[0-9])*[[:space:]]*$')"
+                    if requires_integer_text
+                    else "FALSE"
+                )
                 projections.append(
                     f"CASE WHEN {source} IS NULL THEN "
                     f"error('Cannot convert null to int64') ELSE "
-                    f"CAST({converted} AS BIGINT) END AS {source}"
+                    f"CASE WHEN {invalid_text} THEN "
+                    f"error('Invalid integer text') ELSE "
+                    f"CAST({converted} AS BIGINT) END END AS {source}"
                 )
             elif target is not None:
                 projections.append(
@@ -768,6 +777,11 @@ class DuckDBCompiler:
     def _is_numeric_dtype(cls, dtype: str) -> bool:
         normalized = dtype.lower()
         return cls._is_integer_dtype(dtype) or normalized.startswith(("float", "decimal"))
+
+    @classmethod
+    def _requires_integer_text(cls, dtype: str) -> bool:
+        normalized = dtype.lower()
+        return not cls._is_numeric_dtype(dtype) and not normalized.startswith("bool")
 
     @staticmethod
     def _require_columns(available: list[str], requested: list[str]) -> None:

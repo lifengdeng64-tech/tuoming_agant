@@ -8,6 +8,7 @@ import shutil
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
+from types import MethodType
 
 import duckdb
 import pandas as pd
@@ -488,6 +489,79 @@ def test_integer_cast_accepts_strings_and_rejects_nulls_like_pandas(
         )
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["1", "+1", "-2", " 3", "4 ", "\t-005\n", "000", "1_000"],
+)
+def test_integer_text_cast_acceptance_matches_pandas(
+    value, services, config, workspace
+):
+    expected = int(pd.Series([value]).astype("int64").iloc[0])
+    artifact = _artifact(
+        services,
+        workspace.id,
+        f"accepted-integer-{value!r}",
+        pd.DataFrame({"value": [value]}),
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {
+            "input_artifact_id": artifact.id,
+            "operations": [{"action": "cast", "mapping": {"value": "int64"}}],
+        },
+    )
+    assert actual == [(expected,)]
+
+
+@pytest.mark.parametrize("value", ["1.5", "1e2", "+ 1", "", "  ", "--1"])
+def test_integer_text_cast_rejection_matches_pandas(
+    value, services, config, workspace
+):
+    with pytest.raises(ValueError):
+        pd.Series([value]).astype("int64")
+    artifact = _artifact(
+        services,
+        workspace.id,
+        f"rejected-integer-{value!r}",
+        pd.DataFrame({"value": [value]}),
+    )
+    with pytest.raises(duckdb.Error):
+        _compile_and_fetch(
+            services,
+            config,
+            workspace.id,
+            {
+                "input_artifact_id": artifact.id,
+                "operations": [{"action": "cast", "mapping": {"value": "int64"}}],
+            },
+        )
+
+
+def test_boolean_to_integer_cast_remains_pandas_compatible(
+    services, config, workspace
+):
+    values = pd.Series([True, False])
+    expected = [(int(value),) for value in values.astype("int64")]
+    artifact = _artifact(
+        services,
+        workspace.id,
+        "boolean-integers",
+        pd.DataFrame({"value": values}),
+    )
+    _compiled, actual = _compile_and_fetch(
+        services,
+        config,
+        workspace.id,
+        {
+            "input_artifact_id": artifact.id,
+            "operations": [{"action": "cast", "mapping": {"value": "int64"}}],
+        },
+    )
+    assert actual == expected
+
+
 def test_integer_division_by_zero_matches_current_pandas_evaluator(
     services, config, workspace
 ):
@@ -789,8 +863,6 @@ def test_runtime_owns_compiler_capabilities_and_consumes_them_once(
 ):
     runtime = DuckDBRuntime(config)
     assert callable(getattr(runtime, "compiler", None))
-    assert not hasattr(runtime, "_DuckDBRuntime__authorize")
-    assert not hasattr(runtime, "_DuckDBRuntime__consume")
     compiled = runtime.compiler(services.repository).compile(
         "tenant-a",
         workspace.id,
@@ -803,6 +875,19 @@ def test_runtime_owns_compiler_capabilities_and_consumes_them_once(
         runtime.connection(compiled.sources),
     ):
         pass
+
+
+def test_runtime_public_api_does_not_publish_authority_closures(config):
+    runtime = DuckDBRuntime(config)
+    assert not hasattr(runtime, "__dict__")
+    assert isinstance(runtime.compiler, MethodType)
+    assert runtime.compiler.__func__.__closure__ is None
+    assert isinstance(runtime.connection, MethodType)
+    assert runtime.connection.__wrapped__.__closure__ is None
+    assert not any(
+        hasattr(runtime, name)
+        for name in ("authorize", "consume", "mint", "resolve", "source_authorizer")
+    )
 
 
 def test_source_capability_cannot_cross_runtime_instances(services, config, workspace, source):
