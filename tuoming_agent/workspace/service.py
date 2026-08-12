@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 from tuoming_agent.config import AppConfig
+from tuoming_agent.exporting import ExportedFile, prepare_export
 from tuoming_agent.ingestion.service import IngestionService
 from tuoming_agent.models import ArtifactRecord, ColumnLineage, utc_now
 from tuoming_agent.security.dlp import PromptSanitizer
@@ -23,10 +25,63 @@ class ArtifactService:
         repository: SQLiteRepository,
         artifact_store: ArtifactStore,
         config: AppConfig,
+        masking: MaskingService,
     ):
         self.repository = repository
         self.artifact_store = artifact_store
         self.config = config
+        self.masking = masking
+
+    def preview(
+        self,
+        tenant_id: str,
+        artifact_id: str,
+        limit: int = 1000,
+        restored: bool = False,
+    ) -> pd.DataFrame:
+        if not 1 <= limit <= 1000:
+            raise ValueError("Preview limit must be between 1 and 1000 rows.")
+        artifact = self.repository.get_artifact(tenant_id, artifact_id)
+        parquet = pq.ParquetFile(artifact.path)
+        batch = next(parquet.iter_batches(batch_size=limit), None)
+        frame = (
+            batch.to_pandas()
+            if batch is not None
+            else parquet.schema_arrow.empty_table().to_pandas()
+        )
+        if restored:
+            return self._restore_preview(tenant_id, frame, artifact)
+        return frame
+
+    def export(
+        self,
+        tenant_id: str,
+        artifact_id: str,
+        format: str,
+        *,
+        restored: bool = False,
+    ) -> ExportedFile:
+        artifact = self.repository.get_artifact(tenant_id, artifact_id)
+        exported = prepare_export(
+            artifact,
+            self.masking,
+            tenant_id,
+            self.config.data_dir / "exports",
+            format,
+            restored=restored,
+        )
+        self.repository.add_audit_event(
+            tenant_id,
+            "artifact_export_prepared",
+            artifact.workspace_id,
+            {"artifact_id": artifact.id, "format": format, "restored": restored},
+        )
+        return exported
+
+    def _restore_preview(
+        self, tenant_id: str, frame: pd.DataFrame, artifact: ArtifactRecord
+    ) -> pd.DataFrame:
+        return self.masking.unmask_dataframe(tenant_id, frame, artifact.lineage)
 
     def load(self, tenant_id: str, artifact_id: str) -> tuple[ArtifactRecord, pd.DataFrame]:
         artifact = self.repository.get_artifact(tenant_id, artifact_id)
@@ -230,6 +285,7 @@ def create_services(config: AppConfig) -> ApplicationServices:
     masking = MaskingService(vault)
     artifact_store = ArtifactStore(config.data_dir)
     sanitizer = PromptSanitizer(vault)
+    artifacts = ArtifactService(repository, artifact_store, config, masking)
     return ApplicationServices(
         repository=repository,
         vault=vault,
@@ -240,6 +296,6 @@ def create_services(config: AppConfig) -> ApplicationServices:
             SecureFileStore(config.data_dir, config.master_key),
             artifact_store,
         ),
-        artifacts=ArtifactService(repository, artifact_store, config),
+        artifacts=artifacts,
         conversations=ConversationService(repository, sanitizer),
     )

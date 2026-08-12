@@ -58,10 +58,19 @@ class MaskingService:
         for column in lineage:
             if column not in restored.columns:
                 continue
+            tokens = list(
+                dict.fromkeys(
+                    value
+                    for value in restored[column]
+                    if isinstance(value, str) and not self._is_null(value)
+                )
+            )
+            values = self.vault.resolve_many(tenant_id, tokens)
+            replacements = dict(zip(tokens, values, strict=True))
             restored[column] = restored[column].map(
-                lambda value: value
-                if self._is_null(value) or not isinstance(value, str)
-                else self.vault.resolve(tenant_id, value)
+                lambda value, replacements=replacements: replacements.get(value, value)
+                if isinstance(value, str)
+                else value
             )
         return restored
 

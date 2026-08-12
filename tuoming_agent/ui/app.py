@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import html
-import io
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -13,6 +13,7 @@ from tuoming_agent.analysis.planner import SafeAnalysisPlanner
 from tuoming_agent.analysis.presentation import describe_plan
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService, WorkflowSnapshot
 from tuoming_agent.config import AppConfig, ConfigurationError
+from tuoming_agent.exporting import ExportLimitError
 from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import preview_file
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
@@ -682,12 +683,12 @@ def _render_results_view(
         format_func=lambda artifact_id: _artifact_option(artifact_by_id[artifact_id]),
     )
     st.session_state[f"result-selected-{workspace_id}"] = selected_id
-    artifact, masked = services.artifacts.load(tenant_id, selected_id)
+    artifact = artifact_by_id[selected_id]
 
     info_columns = st.columns(4)
     info_columns[0].metric("类型", _artifact_kind(artifact.kind), border=True)
     info_columns[1].metric("行数", f"{artifact.row_count:,}", border=True)
-    info_columns[2].metric("字段", len(masked.columns), border=True)
+    info_columns[2].metric("字段", len(artifact.schema.get("columns", [])), border=True)
     info_columns[3].metric("脱敏字段", len(artifact.lineage), border=True)
 
     mode = (
@@ -698,28 +699,14 @@ def _render_results_view(
         )
         or "脱敏预览"
     )
-    restored = services.masking.unmask_dataframe(tenant_id, masked, artifact.lineage)
-    visible = masked if mode == "脱敏预览" else restored
-    st.dataframe(visible.head(1000), use_container_width=True, hide_index=True, height=430)
+    visible = services.artifacts.preview(
+        tenant_id, selected_id, restored=mode == "授权还原"
+    )
+    st.dataframe(visible, use_container_width=True, hide_index=True, height=430)
+    st.caption("预览最多读取 1,000 行；下载文件仅在选择格式并准备后生成。")
 
-    safe_col, restored_col, detail_col = st.columns([1, 1, 2], vertical_alignment="bottom")
-    safe_col.download_button(
-        "下载脱敏版",
-        data=_to_excel(masked),
-        file_name=f"masked-{artifact.id[:8]}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        icon=":material/download:",
-        use_container_width=True,
-    )
-    restored_col.download_button(
-        "下载还原版",
-        data=_to_excel(restored),
-        file_name=f"restored-{artifact.id[:8]}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        icon=":material/lock_open:",
-        use_container_width=True,
-    )
-    detail_col.caption(f"制品 ID {artifact.id} · 生成于 {_format_timestamp(artifact.created_at)}")
+    _render_export_controls(services, tenant_id, workspace_id, artifact)
+    st.caption(f"制品 ID {artifact.id} · 生成于 {_format_timestamp(artifact.created_at)}")
 
     with st.expander("制品详情", icon=":material/account_tree:"):
         detail_left, detail_right = st.columns(2, gap="large")
@@ -752,6 +739,98 @@ def _render_results_view(
         st.caption(f"来源制品：{', '.join(artifact.parent_ids) or '加密上传文件'}")
 
 
+def _render_export_controls(
+    services: ApplicationServices,
+    tenant_id: str,
+    workspace_id: str,
+    artifact: Any,
+) -> None:
+    format_label = st.selectbox(
+        "下载格式",
+        ("CSV", "Parquet", "Excel"),
+        help="Excel 仅适用于不超过 100,000 行且估算数据量不超过 50 MiB 的结果。",
+    )
+    format_name = {"CSV": "csv", "Parquet": "parquet", "Excel": "xlsx"}[format_label]
+    state_key = f"prepared-export-{workspace_id}"
+    prepared = st.session_state.get(state_key)
+    if prepared and prepared["artifact_id"] != artifact.id:
+        _cleanup_prepared_export(prepared)
+        st.session_state.pop(state_key, None)
+        prepared = None
+
+    safe_col, restored_col = st.columns(2)
+    if safe_col.button(
+        "准备脱敏下载",
+        icon=":material/download:",
+        use_container_width=True,
+    ):
+        _prepare_export(
+            services, tenant_id, artifact, format_name, False, state_key, prepared
+        )
+    if restored_col.button(
+        "准备还原下载",
+        icon=":material/lock_open:",
+        disabled=format_name == "parquet",
+        help="还原版使用血缘逐块恢复；请选择 CSV 或小型 Excel。",
+        use_container_width=True,
+    ):
+        _prepare_export(
+            services, tenant_id, artifact, format_name, True, state_key, prepared
+        )
+
+    prepared = st.session_state.get(state_key)
+    if not prepared:
+        return
+    path = Path(prepared["path"])
+    if not path.is_file():
+        st.session_state.pop(state_key, None)
+        st.warning("已准备的下载文件已过期，请重新准备。")
+        return
+    with path.open("rb") as stream:
+        st.download_button(
+            "下载已准备文件",
+            data=stream,
+            file_name=prepared["file_name"],
+            mime=prepared["mime"],
+            on_click="ignore",
+            icon=":material/download:",
+            type="primary",
+            use_container_width=True,
+        )
+
+
+def _prepare_export(
+    services: ApplicationServices,
+    tenant_id: str,
+    artifact: Any,
+    format_name: str,
+    restored: bool,
+    state_key: str,
+    previous: dict[str, Any] | None,
+) -> None:
+    try:
+        exported = services.artifacts.export(
+            tenant_id, artifact.id, format_name, restored=restored
+        )
+    except (ExportLimitError, ValueError) as exc:
+        st.error(str(exc))
+        return
+    if previous:
+        _cleanup_prepared_export(previous)
+    st.session_state[state_key] = {
+        "artifact_id": artifact.id,
+        "path": str(exported.path),
+        "file_name": exported.file_name,
+        "mime": exported.mime,
+        "temporary": exported.temporary,
+    }
+
+
+def _cleanup_prepared_export(prepared: dict[str, Any]) -> None:
+    if prepared.get("temporary"):
+        Path(prepared["path"]).unlink(missing_ok=True)
+
+
 def _policy_frame(dataframe: pd.DataFrame, detected: set[str]) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -765,13 +844,6 @@ def _policy_frame(dataframe: pd.DataFrame, detected: set[str]) -> pd.DataFrame:
             for column in dataframe.columns
         ]
     )
-
-
-def _to_excel(dataframe: pd.DataFrame) -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        dataframe.to_excel(writer, index=False, sheet_name="Result")
-    return buffer.getvalue()
 
 
 def _default_domain(column: str) -> str:

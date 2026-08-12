@@ -200,6 +200,31 @@ class TokenVault:
             raise RecordNotFoundError("Token not found for this tenant.")
         return self._decrypt_mapping(mapping)
 
+    def resolve_many(self, tenant_id: str, tokens: list[str]) -> list[Any]:
+        """Resolve one bounded token batch with batched SQLite reads."""
+        if not tokens:
+            return []
+        connect = getattr(self.repository, "_connect", None)
+        if connect is None:
+            return [self.resolve(tenant_id, token) for token in tokens]
+        unique = list(dict.fromkeys(tokens))
+        mappings: dict[str, dict[str, Any]] = {}
+        with connect() as connection:
+            for offset in range(0, len(unique), 900):
+                batch = unique[offset : offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""SELECT * FROM token_mappings
+                    WHERE tenant_id = ? AND token IN ({placeholders})""",
+                    (tenant_id, *batch),
+                ).fetchall()
+                mappings.update({str(row["token"]): dict(row) for row in rows})
+        missing = next((token for token in unique if token not in mappings), None)
+        if missing is not None:
+            raise RecordNotFoundError("Token not found for this tenant.")
+        resolved = {token: self._decrypt_mapping(mappings[token]) for token in unique}
+        return [resolved[token] for token in tokens]
+
     def iter_plaintext_tokens(self, tenant_id: str) -> Iterator[tuple[str, str]]:
         for mapping in self.repository.list_mappings(tenant_id):
             value = self._decrypt_mapping(mapping)

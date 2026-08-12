@@ -27,6 +27,43 @@ def test_streamlit_workspace_renders_without_runtime_errors(monkeypatch, tmp_pat
     ]
 
 
+def test_results_page_uses_bounded_preview_without_eager_full_load(monkeypatch, tmp_path: Path):
+    encoded_key = base64.urlsafe_b64encode(b"k" * 32).decode("ascii")
+    data_dir = tmp_path / "bounded-results-ui"
+    monkeypatch.setenv("MASKING_MASTER_KEY", encoded_key)
+    monkeypatch.setenv("TUOMING_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("TUOMING_DEFAULT_TENANT", "ui-results-tenant")
+    config = AppConfig(
+        master_key=b"k" * 32,
+        key_version=1,
+        data_dir=data_dir,
+        default_tenant="ui-results-tenant",
+    )
+    services = create_services(config)
+    workspace = services.repository.create_workspace("ui-results-tenant", "result-workspace")
+    services.artifacts.save_result(
+        "ui-results-tenant",
+        workspace.id,
+        "bounded-result",
+        pd.DataFrame({"value": range(1_001)}),
+        {},
+        (),
+    )
+    monkeypatch.setattr(
+        "tuoming_agent.workspace.service.ArtifactService.load",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("result page must not eagerly load the full artifact")
+        ),
+    )
+
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    app.query_params["view"] = "结果"
+    app.run(timeout=30)
+
+    assert not app.exception
+    assert len(app.dataframe) >= 1
+
+
 def test_streamlit_restores_pending_plan_and_requires_confirmation(monkeypatch, tmp_path: Path):
     encoded_key = base64.urlsafe_b64encode(b"k" * 32).decode("ascii")
     data_dir = tmp_path / "workflow-ui-data"
