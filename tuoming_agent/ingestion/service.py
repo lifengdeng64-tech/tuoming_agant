@@ -55,7 +55,11 @@ class IngestionService:
         filename: str,
         content: bytes | BinaryIO,
         policies: dict[str, dict[str, ColumnPolicy]],
+        *,
+        retained_columns: dict[str, set[str]] | None = None,
     ) -> IngestionResult:
+        retained_columns = retained_columns or {}
+        retained_sensitive_columns: dict[str, set[str]] = {}
         if isinstance(content, bytes):
             validate_upload_size(filename, len(content))
             source = BytesIO(content)
@@ -83,8 +87,12 @@ class IngestionService:
             if table.logical_name not in table_names:
                 table_names.append(table.logical_name)
             table_policies = policies.get(table.logical_name, {})
+            table_retained = retained_columns.get(table.logical_name, set())
             detected = detect_sensitive_columns(table.dataframe, sample_size=None)
-            missing_policies = sorted(detected - set(table_policies))
+            retained_sensitive_columns.setdefault(table.logical_name, set()).update(
+                detected & table_retained
+            )
+            missing_policies = sorted(detected - set(table_policies) - table_retained)
             if missing_policies:
                 raise UnsafeIngestionError(
                     "Sensitive columns require a masking policy: " + ", ".join(missing_policies)
@@ -102,18 +110,27 @@ class IngestionService:
             for logical_name, table_chunks in groupby(chunks, key=lambda table: table.logical_name):
                 artifact_id = str(uuid.uuid4())
                 table_policies = policies.get(logical_name, {})
+                table_retained = retained_columns.get(logical_name, set())
                 row_count = 0
                 schema: dict[str, Any] | None = None
                 lineage: dict[str, Any] = {}
                 sheet_name: str | None = None
 
                 def masked_chunks(
-                    selected_chunks=table_chunks, selected_policies=table_policies
+                    selected_chunks=table_chunks,
+                    selected_policies=table_policies,
+                    selected_retained=table_retained,
+                    selected_logical_name=logical_name,
                 ):
                     nonlocal row_count, schema, lineage, sheet_name
                     for table in selected_chunks:
                         detected = detect_sensitive_columns(table.dataframe, sample_size=None)
-                        missing_policies = sorted(detected - set(selected_policies))
+                        retained_sensitive_columns.setdefault(
+                            selected_logical_name, set()
+                        ).update(detected & selected_retained)
+                        missing_policies = sorted(
+                            detected - set(selected_policies) - selected_retained
+                        )
                         if missing_policies:
                             raise UnsafeIngestionError(
                                 "Sensitive columns require a masking policy: "
@@ -218,7 +235,15 @@ class IngestionService:
             tenant_id,
             "file_ingested",
             workspace_id,
-            {"sha256_prefix": content_hash[:12], "table_count": len(created)},
+            {
+                "sha256_prefix": content_hash[:12],
+                "table_count": len(created),
+                "retained_sensitive_columns": {
+                    table_name: sorted(columns)
+                    for table_name, columns in retained_sensitive_columns.items()
+                    if columns
+                },
+            },
         )
         return IngestionResult(file_record["id"], content_hash, tuple(created), False)
 

@@ -170,6 +170,19 @@ def test_ui_accepted_upload_never_calls_getvalue(monkeypatch) -> None:
     ui_app._render_data_view(object(), "tenant", "workspace", [], [])
 
 
+def test_ui_column_choices_preserve_explicitly_retained_fields() -> None:
+    edited = ui_app._policy_frame(
+        pd.DataFrame({"酒店均价": [399.0], "客户姓名": ["张三"]}),
+        {"酒店均价", "客户姓名"},
+    )
+    edited.loc[edited["字段"] == "酒店均价", "脱敏"] = False
+
+    policies, retained = ui_app._column_choices(edited)
+
+    assert set(policies) == {"客户姓名"}
+    assert retained == {"酒店均价"}
+
+
 def test_secure_file_store_streams_encryption_and_reads_legacy_files(tmp_path: Path) -> None:
     store = SecureFileStore(tmp_path, b"test-master-key-material-32-bytes!")
     content = (b"streaming-content-" * 1000) + b"end"

@@ -107,3 +107,27 @@ def test_detected_sensitive_column_fails_closed_before_persistence(services, wor
         is None
     )
 
+
+def test_explicitly_retained_sensitive_column_can_be_ingested_and_is_audited(
+    services, workspace
+):
+    content = pd.DataFrame(
+        {"酒店均价": [399.0], "客户RevPar": [280.0]}
+    ).to_csv(index=False).encode("utf-8-sig")
+
+    result = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "metrics.csv",
+        content,
+        {"metrics": {}},
+        retained_columns={"metrics": {"酒店均价", "客户RevPar"}},
+    )
+
+    restored = services.ingestion.artifact_store.read_dataframe(result.artifacts[0].path)
+    event = services.repository.list_audit_events("tenant-a", workspace.id)[0]
+
+    assert restored.to_dict("records") == [{"酒店均价": 399.0, "客户RevPar": 280.0}]
+    assert event["details"]["retained_sensitive_columns"] == {
+        "metrics": sorted(["酒店均价", "客户RevPar"])
+    }
