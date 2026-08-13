@@ -5,6 +5,7 @@ import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -188,6 +189,30 @@ CREATE TABLE IF NOT EXISTS analysis_attempts (
     UNIQUE(run_id, attempt_number)
 );
 """
+
+
+@dataclass(frozen=True)
+class DeletionImpact:
+    file_id: str
+    original_name: str
+    sha256: str
+    dataset_version_ids: tuple[str, ...]
+    dataset_ids: tuple[str, ...]
+    artifact_ids: tuple[str, ...]
+    analysis_run_ids: tuple[str, ...]
+    paths: tuple[Path, ...]
+
+    @property
+    def dataset_version_count(self) -> int:
+        return len(self.dataset_version_ids)
+
+    @property
+    def artifact_count(self) -> int:
+        return len(self.artifact_ids)
+
+    @property
+    def analysis_run_count(self) -> int:
+        return len(self.analysis_run_ids)
 
 
 class SQLiteRepository:
@@ -490,6 +515,204 @@ class SQLiteRepository:
                 (tenant_id, file_id),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def inspect_file_deletion(
+        self, tenant_id: str, workspace_id: str, file_id: str
+    ) -> DeletionImpact:
+        with self._connect() as connection:
+            return self._inspect_file_deletion(
+                connection, tenant_id, workspace_id, file_id
+            )
+
+    def delete_file_metadata(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        impact: DeletionImpact,
+    ) -> DeletionImpact:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            actual = self._inspect_file_deletion(
+                connection, tenant_id, workspace_id, impact.file_id
+            )
+            self._delete_ids(
+                connection,
+                "analysis_plan_versions",
+                "run_id",
+                actual.analysis_run_ids,
+                tenant_id,
+            )
+            self._delete_ids(
+                connection,
+                "analysis_attempts",
+                "run_id",
+                actual.analysis_run_ids,
+                tenant_id,
+            )
+            self._delete_ids(
+                connection,
+                "analysis_runs",
+                "id",
+                actual.analysis_run_ids,
+                tenant_id,
+            )
+            if actual.artifact_ids:
+                placeholders = ",".join("?" for _ in actual.artifact_ids)
+                connection.execute(
+                    f"""UPDATE messages SET artifact_id = NULL
+                    WHERE tenant_id = ? AND artifact_id IN ({placeholders})""",
+                    (tenant_id, *actual.artifact_ids),
+                )
+            self._delete_ids(
+                connection,
+                "column_policies",
+                "dataset_version_id",
+                actual.dataset_version_ids,
+                tenant_id,
+            )
+            self._delete_ids(
+                connection,
+                "dataset_versions",
+                "id",
+                actual.dataset_version_ids,
+                tenant_id,
+            )
+            self._delete_ids(
+                connection,
+                "artifacts",
+                "id",
+                actual.artifact_ids,
+                tenant_id,
+            )
+            cursor = connection.execute(
+                """DELETE FROM files
+                WHERE id = ? AND tenant_id = ? AND workspace_id = ?""",
+                (actual.file_id, tenant_id, workspace_id),
+            )
+            if cursor.rowcount != 1:
+                raise RecordNotFoundError("File not found during deletion.")
+            if actual.dataset_ids:
+                placeholders = ",".join("?" for _ in actual.dataset_ids)
+                connection.execute(
+                    f"""DELETE FROM datasets
+                    WHERE tenant_id = ? AND workspace_id = ?
+                    AND id IN ({placeholders})
+                    AND NOT EXISTS (
+                        SELECT 1 FROM dataset_versions dv WHERE dv.dataset_id = datasets.id
+                    )""",
+                    (tenant_id, workspace_id, *actual.dataset_ids),
+                )
+            connection.execute(
+                """INSERT INTO audit_events(
+                    id, tenant_id, workspace_id, event_type, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    tenant_id,
+                    workspace_id,
+                    "file_deleted",
+                    json.dumps(
+                        {
+                            "file_id": actual.file_id,
+                            "sha256_prefix": actual.sha256[:12],
+                            "dataset_version_count": actual.dataset_version_count,
+                            "artifact_count": actual.artifact_count,
+                            "analysis_run_count": actual.analysis_run_count,
+                        },
+                        ensure_ascii=True,
+                    ),
+                    utc_now(),
+                ),
+            )
+            return actual
+
+    @staticmethod
+    def _delete_ids(
+        connection: sqlite3.Connection,
+        table: str,
+        column: str,
+        record_ids: tuple[str, ...],
+        tenant_id: str,
+    ) -> None:
+        if not record_ids:
+            return
+        allowed = {
+            ("analysis_plan_versions", "run_id"),
+            ("analysis_attempts", "run_id"),
+            ("analysis_runs", "id"),
+            ("column_policies", "dataset_version_id"),
+            ("dataset_versions", "id"),
+            ("artifacts", "id"),
+        }
+        if (table, column) not in allowed:
+            raise ValueError("Unsupported scoped deletion target.")
+        placeholders = ",".join("?" for _ in record_ids)
+        connection.execute(
+            f"DELETE FROM {table} WHERE tenant_id = ? AND {column} IN ({placeholders})",
+            (tenant_id, *record_ids),
+        )
+
+    @staticmethod
+    def _inspect_file_deletion(
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        workspace_id: str,
+        file_id: str,
+    ) -> DeletionImpact:
+        file_row = connection.execute(
+            "SELECT * FROM files WHERE id = ?", (file_id,)
+        ).fetchone()
+        if file_row is None:
+            raise RecordNotFoundError("File not found.")
+        if file_row["tenant_id"] != tenant_id:
+            raise AuthorizationError("File belongs to another tenant.")
+        if file_row["workspace_id"] != workspace_id:
+            raise AuthorizationError("File belongs to another workspace.")
+
+        versions = connection.execute(
+            """SELECT id, dataset_id, artifact_id FROM dataset_versions
+            WHERE tenant_id = ? AND file_id = ?""",
+            (tenant_id, file_id),
+        ).fetchall()
+        artifact_ids = {row["artifact_id"] for row in versions}
+        all_artifacts = connection.execute(
+            """SELECT id, path, parent_ids_json FROM artifacts
+            WHERE tenant_id = ? AND workspace_id = ?""",
+            (tenant_id, workspace_id),
+        ).fetchall()
+        changed = True
+        while changed:
+            changed = False
+            for artifact in all_artifacts:
+                parents = set(json.loads(artifact["parent_ids_json"]))
+                if artifact["id"] not in artifact_ids and parents & artifact_ids:
+                    artifact_ids.add(artifact["id"])
+                    changed = True
+
+        if artifact_ids:
+            placeholders = ",".join("?" for _ in artifact_ids)
+            runs = connection.execute(
+                f"""SELECT id FROM analysis_runs
+                WHERE tenant_id = ? AND workspace_id = ?
+                AND (source_artifact_id IN ({placeholders})
+                     OR result_artifact_id IN ({placeholders}))""",
+                (tenant_id, workspace_id, *artifact_ids, *artifact_ids),
+            ).fetchall()
+        else:
+            runs = []
+        artifact_paths = [
+            Path(row["path"]) for row in all_artifacts if row["id"] in artifact_ids
+        ]
+        return DeletionImpact(
+            file_id=file_id,
+            original_name=file_row["original_name"],
+            sha256=file_row["sha256"],
+            dataset_version_ids=tuple(sorted(row["id"] for row in versions)),
+            dataset_ids=tuple(sorted({row["dataset_id"] for row in versions})),
+            artifact_ids=tuple(sorted(artifact_ids)),
+            analysis_run_ids=tuple(sorted(row["id"] for row in runs)),
+            paths=(Path(file_row["encrypted_path"]), *sorted(artifact_paths)),
+        )
 
     def list_files(
         self, tenant_id: str, workspace_id: str, limit: int = 100
