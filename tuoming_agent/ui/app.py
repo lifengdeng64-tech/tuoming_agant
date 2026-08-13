@@ -279,7 +279,14 @@ def _render_data_view(
         key=f"uploader-{workspace_id}",
         label_visibility="collapsed",
     )
-    prepared: list[tuple[str, Any, dict[str, dict[str, ColumnPolicy]]]] = []
+    prepared: list[
+        tuple[
+            str,
+            Any,
+            dict[str, dict[str, ColumnPolicy]],
+            dict[str, set[str]],
+        ]
+    ] = []
 
     for uploaded in uploaded_files or []:
         try:
@@ -292,6 +299,7 @@ def _render_data_view(
             f"{uploaded.name}|{uploaded.size}".encode()
         ).hexdigest()[:12]
         file_policies: dict[str, dict[str, ColumnPolicy]] = {}
+        file_retained: dict[str, set[str]] = {}
         with st.expander(
             f"{uploaded.name} · {_format_bytes(uploaded.size)} · {len(tables)} 张表",
             expanded=True,
@@ -304,7 +312,8 @@ def _render_data_view(
                 st.markdown(f"**{table.logical_name}**")
                 st.caption(
                     f"{len(table.dataframe):,} 行 · {len(table.dataframe.columns)} 列 · "
-                    f"检测到 {len(detected)} 个敏感字段"
+                    f"检测到 {len(detected)} 个疑似敏感字段。"
+                    "取消勾选表示明确保留原值，提交时将记入审计日志。"
                 )
                 policy_frame = _policy_frame(table.dataframe, detected)
                 edited = st.data_editor(
@@ -324,21 +333,16 @@ def _render_data_view(
                         "检测结果": st.column_config.TextColumn("检测结果", width="small"),
                     },
                 )
-                policies: dict[str, ColumnPolicy] = {}
-                for row in edited.to_dict("records"):
-                    if row["脱敏"]:
-                        policies[str(row["字段"])] = ColumnPolicy(
-                            domain=str(row["语义域"]),
-                            normalizer=str(row["标准化"]),
-                        )
+                policies, retained = _column_choices(edited)
                 file_policies[table.logical_name] = policies
+                file_retained[table.logical_name] = retained
                 with st.expander("数据预览"):
                     st.dataframe(
                         table.dataframe.head(8),
                         use_container_width=True,
                         hide_index=True,
                     )
-        prepared.append((uploaded.name, uploaded, file_policies))
+        prepared.append((uploaded.name, uploaded, file_policies, file_retained))
 
     if prepared and st.button(
         f"确认并追加 {len(prepared)} 个文件",
@@ -348,8 +352,15 @@ def _render_data_view(
     ):
         try:
             results = [
-                services.ingestion.ingest(tenant_id, workspace_id, filename, source, policies)
-                for filename, source, policies in prepared
+                services.ingestion.ingest(
+                    tenant_id,
+                    workspace_id,
+                    filename,
+                    source,
+                    policies,
+                    retained_columns=retained,
+                )
+                for filename, source, policies, retained in prepared
             ]
             added = sum(not result.duplicate for result in results)
             duplicates = len(results) - added
@@ -845,6 +856,23 @@ def _policy_frame(dataframe: pd.DataFrame, detected: set[str]) -> pd.DataFrame:
             for column in dataframe.columns
         ]
     )
+
+
+def _column_choices(
+    edited: pd.DataFrame,
+) -> tuple[dict[str, ColumnPolicy], set[str]]:
+    policies: dict[str, ColumnPolicy] = {}
+    retained: set[str] = set()
+    for row in edited.to_dict("records"):
+        column = str(row["字段"])
+        if row["脱敏"]:
+            policies[column] = ColumnPolicy(
+                domain=str(row["语义域"]),
+                normalizer=str(row["标准化"]),
+            )
+        else:
+            retained.add(column)
+    return policies, retained
 
 
 def _default_domain(column: str) -> str:
