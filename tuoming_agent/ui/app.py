@@ -20,6 +20,7 @@ from tuoming_agent.ingestion.scanner import detect_sensitive_columns
 from tuoming_agent.maintenance import DiskHeadroomError
 from tuoming_agent.security.dlp import SensitiveContentError
 from tuoming_agent.security.masking import ColumnPolicy
+from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
 from tuoming_agent.ui.styles import APP_STYLES
 from tuoming_agent.workspace.service import ApplicationServices, create_services
 
@@ -403,8 +404,80 @@ def _render_data_view(
                 ]
             )
             st.dataframe(file_table, use_container_width=True, hide_index=True)
+            for file_record in files:
+                action_col, delete_col = st.columns([4, 1], vertical_alignment="center")
+                action_col.caption(
+                    f"{file_record['original_name']} · {file_record['sha256'][:10]}"
+                )
+                if delete_col.button(
+                    "删除",
+                    key=f"delete-file-{workspace_id}-{file_record['id']}",
+                    use_container_width=True,
+                ):
+                    st.session_state[f"pending-delete-{workspace_id}"] = file_record["id"]
+                    st.rerun()
+                _render_file_deletion(
+                    services, tenant_id, workspace_id, file_record
+                )
         else:
             _empty_state("暂无上传记录", "文件")
+
+
+def _render_file_deletion(
+    services: Any,
+    tenant_id: str,
+    workspace_id: str,
+    file_record: dict[str, Any],
+) -> None:
+    state_key = f"pending-delete-{workspace_id}"
+    if st.session_state.get(state_key) != file_record["id"]:
+        return
+    try:
+        impact = services.data_sources.inspect(
+            tenant_id, workspace_id, file_record["id"]
+        )
+    except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
+        st.warning(f"无法检查删除影响：{exc}")
+        return
+
+    has_dependencies = impact.analysis_run_count > 0 or impact.artifact_count > 1
+    st.warning(
+        f"将删除 {impact.dataset_version_count} 个数据版本、"
+        f"{impact.artifact_count} 个本地制品和 "
+        f"{impact.analysis_run_count} 个关联分析。聊天文字会保留。"
+    )
+    acknowledged = True
+    if has_dependencies:
+        acknowledged = st.checkbox(
+            "我了解关联内容也会删除",
+            key=f"ack-delete-{workspace_id}-{file_record['id']}",
+        )
+    st.caption("该操作会删除本地加密原件和关联制品，且不能撤销。")
+    if st.button(
+        "确认删除",
+        key=f"confirm-delete-{workspace_id}-{file_record['id']}",
+        type="primary",
+        disabled=not acknowledged,
+    ):
+        try:
+            deleted = services.data_sources.delete(
+                tenant_id, workspace_id, file_record["id"]
+            )
+        except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
+            st.warning(f"删除失败，原数据已保留：{exc}")
+            return
+        st.session_state.pop(state_key, None)
+        _set_flash(
+            "success",
+            f"已删除 {deleted.original_name} 及 {deleted.artifact_count} 个关联制品。",
+        )
+        st.rerun()
+    if st.button(
+        "取消",
+        key=f"cancel-delete-{workspace_id}-{file_record['id']}",
+    ):
+        st.session_state.pop(state_key, None)
+        st.rerun()
 
 
 def _render_analysis_view(

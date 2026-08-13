@@ -27,6 +27,7 @@ from tuoming_agent.maintenance import (
 from tuoming_agent.security.crypto import STREAM_MAGIC, derive_key
 from tuoming_agent.security.masking import ColumnPolicy
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
+from tuoming_agent.storage.sqlite import DeletionImpact
 from tuoming_agent.ui import app as ui_app
 
 MIB = 1024 * 1024
@@ -40,6 +41,89 @@ class BoundedReadStream(BytesIO):
         if size is None or size < 0:
             raise AssertionError("stream consumers must use bounded reads")
         return super().read(size)
+
+
+def test_file_deletion_with_analysis_requires_acknowledgement(monkeypatch) -> None:
+    impact = DeletionImpact(
+        file_id="file-a",
+        original_name="wrong.csv",
+        sha256="a" * 64,
+        dataset_version_ids=("version-a",),
+        dataset_ids=("dataset-a",),
+        artifact_ids=("source-a", "result-a"),
+        analysis_run_ids=("run-a",),
+        paths=(Path("source.enc"), Path("source.parquet")),
+    )
+
+    class DataSources:
+        deleted = False
+
+        def inspect(self, *_args):
+            return impact
+
+        def delete(self, *_args):
+            self.deleted = True
+
+    class Services:
+        data_sources = DataSources()
+
+    monkeypatch.setattr(ui_app.st, "session_state", {"pending-delete-workspace": "file-a"})
+    monkeypatch.setattr(ui_app.st, "warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "checkbox", lambda *_args, **_kwargs: False)
+    disabled = []
+
+    def button(label, **kwargs):
+        if label == "确认删除":
+            disabled.append(kwargs["disabled"])
+        return False
+
+    monkeypatch.setattr(ui_app.st, "button", button)
+
+    ui_app._render_file_deletion(Services(), "tenant", "workspace", {"id": "file-a"})
+
+    assert disabled == [True]
+    assert Services.data_sources.deleted is False
+
+
+def test_confirmed_file_deletion_calls_service_and_refreshes(monkeypatch) -> None:
+    impact = DeletionImpact(
+        file_id="file-a",
+        original_name="wrong.csv",
+        sha256="a" * 64,
+        dataset_version_ids=("version-a",),
+        dataset_ids=("dataset-a",),
+        artifact_ids=("source-a",),
+        analysis_run_ids=("run-a",),
+        paths=(Path("source.enc"), Path("source.parquet")),
+    )
+    deleted = []
+
+    class DataSources:
+        def inspect(self, *_args):
+            return impact
+
+        def delete(self, *args):
+            deleted.append(args)
+            return impact
+
+    class Services:
+        data_sources = DataSources()
+
+    state = {"pending-delete-workspace": "file-a"}
+    monkeypatch.setattr(ui_app.st, "session_state", state)
+    monkeypatch.setattr(ui_app.st, "warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "checkbox", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        ui_app.st, "button", lambda label, **_kwargs: label == "确认删除"
+    )
+    monkeypatch.setattr(ui_app.st, "rerun", lambda: None)
+
+    ui_app._render_file_deletion(Services(), "tenant", "workspace", {"id": "file-a"})
+
+    assert deleted == [("tenant", "workspace", "file-a")]
+    assert "pending-delete-workspace" not in state
 
     def read1(self, size: int = -1) -> bytes:
         if size is None or size < 0:
