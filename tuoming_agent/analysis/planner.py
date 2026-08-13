@@ -50,7 +50,11 @@ class SafeAnalysisPlanner:
 
     def create_plan(self, safe_request: str, safe_context: dict[str, Any]) -> AnalysisPlan:
         payload = json.dumps(
-            {"request": safe_request, "workspace_context": safe_context},
+            {
+                "request": safe_request,
+                "workspace_context": safe_context,
+                "analysis_plan_schema": AnalysisPlan.model_json_schema(),
+            },
             ensure_ascii=False,
             separators=(",", ":"),
         )
