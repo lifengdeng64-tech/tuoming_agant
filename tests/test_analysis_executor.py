@@ -97,3 +97,4 @@ def test_concurrent_artifacts_use_unique_paths(services, workspace):
     assert len(paths) == 12
     assert all(path.exists() for path in paths)
     assert not list(services.artifacts.artifact_store.root.rglob("*.tmp*"))
+

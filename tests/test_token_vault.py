@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pandas as pd
 
 from tuoming_agent.config import AppConfig
@@ -30,6 +32,41 @@ def test_same_domain_value_is_stable_across_files_and_restart(config: AppConfig,
     assert token == second.loc[0, "酒店名称"] == third.loc[0, "门店名"]
     assert token.startswith("STORE_V1_")
     assert len(token.rsplit("_", 1)[1]) >= 16
+
+
+def test_batch_masking_reuses_tokens_without_per_cell_connections(monkeypatch, services):
+    connection_count = 0
+    original_connect = services.repository._connect
+
+    @contextmanager
+    def counted_connect():
+        nonlocal connection_count
+        connection_count += 1
+        with original_connect() as connection:
+            yield connection
+
+    monkeypatch.setattr(services.repository, "_connect", counted_connect)
+    source = pd.DataFrame({"customer": ["Alice", "Bob", "Alice", "Carol", "Bob"]})
+
+    masked, _ = services.masking.mask_dataframe(
+        "tenant-a", source, {"customer": ColumnPolicy("person", "casefold")}
+    )
+
+    assert masked.loc[0, "customer"] == masked.loc[2, "customer"]
+    assert masked.loc[1, "customer"] == masked.loc[4, "customer"]
+    assert len(set(masked["customer"])) == 3
+    assert connection_count <= 2
+
+
+def test_tokenize_many_preserves_tenant_and_domain_boundaries(services):
+    values = ["Shared", "Shared"]
+
+    first = services.vault.tokenize_many("tenant-a", "person", values, "casefold")
+    other_tenant = services.vault.tokenize_many("tenant-b", "person", values, "casefold")
+    other_domain = services.vault.tokenize_many("tenant-a", "store", values, "casefold")
+
+    assert first[0] == first[1]
+    assert len({first[0], other_tenant[0], other_domain[0]}) == 3
 
 
 def test_tenant_domain_normalization_and_key_version_are_scoped(config, services):

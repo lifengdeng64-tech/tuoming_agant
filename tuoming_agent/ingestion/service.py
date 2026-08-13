@@ -3,10 +3,15 @@ from __future__ import annotations
 import hashlib
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from io import BytesIO
+from itertools import groupby
+from pathlib import Path
+from typing import Any, BinaryIO
 
-from tuoming_agent.ingestion.parser import ParsedTable, parse_file
+from tuoming_agent.ingestion.limits import validate_upload_size
+from tuoming_agent.ingestion.parser import ParsedTable, iter_file_chunks, parse_file
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
+from tuoming_agent.maintenance import ensure_disk_headroom
 from tuoming_agent.models import ArtifactRecord, utc_now
 from tuoming_agent.security.masking import ColumnPolicy, MaskingService
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
@@ -32,11 +37,13 @@ class IngestionService:
         masking_service: MaskingService,
         secure_file_store: SecureFileStore,
         artifact_store: ArtifactStore,
+        temp_reserve_bytes: int,
     ):
         self.repository = repository
         self.masking_service = masking_service
         self.secure_file_store = secure_file_store
         self.artifact_store = artifact_store
+        self.temp_reserve_bytes = temp_reserve_bytes
 
     def preview(self, filename: str, content: bytes) -> list[ParsedTable]:
         return parse_file(filename, content)
@@ -46,10 +53,21 @@ class IngestionService:
         tenant_id: str,
         workspace_id: str,
         filename: str,
-        content: bytes,
+        content: bytes | BinaryIO,
         policies: dict[str, dict[str, ColumnPolicy]],
     ) -> IngestionResult:
-        content_hash = hashlib.sha256(content).hexdigest()
+        if isinstance(content, bytes):
+            validate_upload_size(filename, len(content))
+            source = BytesIO(content)
+        else:
+            source = content
+        byte_size, content_hash = self._measure_and_hash(source)
+        validate_upload_size(filename, byte_size)
+        ensure_disk_headroom(
+            self.artifact_store.root,
+            byte_size,
+            self.temp_reserve_bytes,
+        )
         duplicate = self.repository.find_file_by_hash(tenant_id, workspace_id, content_hash)
         if duplicate:
             versions = self.repository.get_file_versions(tenant_id, duplicate["id"])
@@ -59,70 +77,141 @@ class IngestionService:
             )
             return IngestionResult(duplicate["id"], content_hash, artifacts, True)
 
-        tables = parse_file(filename, content)
-        for table in tables:
+        source.seek(0)
+        table_names: list[str] = []
+        for table in iter_file_chunks(filename, source):
+            if table.logical_name not in table_names:
+                table_names.append(table.logical_name)
             table_policies = policies.get(table.logical_name, {})
-            detected = detect_sensitive_columns(table.dataframe)
+            detected = detect_sensitive_columns(table.dataframe, sample_size=None)
             missing_policies = sorted(detected - set(table_policies))
             if missing_policies:
                 raise UnsafeIngestionError(
                     "Sensitive columns require a masking policy: " + ", ".join(missing_policies)
                 )
-        encrypted_path = self.secure_file_store.write(
-            tenant_id, workspace_id, content_hash, content
-        )
-        file_record = self.repository.create_file(
-            tenant_id,
-            workspace_id,
-            content_hash,
-            filename,
-            str(encrypted_path),
-            len(content),
-        )
-        created: list[ArtifactRecord] = []
-        for table in tables:
-            table_policies = policies.get(table.logical_name, {})
-            masked, lineage = self.masking_service.mask_dataframe(
-                tenant_id, table.dataframe, table_policies
-            )
-            artifact_id = str(uuid.uuid4())
-            artifact_path = self.artifact_store.write_dataframe(
-                tenant_id, workspace_id, artifact_id, masked
-            )
-            artifact = ArtifactRecord(
-                id=artifact_id,
-                tenant_id=tenant_id,
-                workspace_id=workspace_id,
-                kind="dataset",
-                name=table.logical_name,
-                path=artifact_path,
-                row_count=len(masked),
-                schema=self._schema(masked),
-                lineage=lineage,
-                parent_ids=(),
-                created_at=utc_now(),
-            )
-            self.repository.create_artifact(artifact)
-            dataset = self.repository.get_or_create_dataset(
-                tenant_id, workspace_id, table.logical_name
-            )
-            version = self.repository.create_dataset_version(
-                tenant_id,
-                dataset["id"],
-                file_record["id"],
-                artifact.id,
-                table.sheet_name,
-            )
-            for column_name, policy in table_policies.items():
-                self.repository.add_column_policy(
-                    tenant_id,
-                    version["id"],
-                    column_name,
-                    policy.domain,
-                    policy.normalizer,
-                    self.masking_service.vault.key_version,
+        if not table_names:
+            raise ValueError("The upload contains no tabular rows.")
+
+        pending: list[tuple[ArtifactRecord, str | None, dict[str, ColumnPolicy]]] = []
+        created_paths: list[Path] = []
+        encrypted_path: Path | None = None
+        encrypted_created = False
+        source.seek(0)
+        try:
+            chunks = iter_file_chunks(filename, source)
+            for logical_name, table_chunks in groupby(chunks, key=lambda table: table.logical_name):
+                artifact_id = str(uuid.uuid4())
+                table_policies = policies.get(logical_name, {})
+                row_count = 0
+                schema: dict[str, Any] | None = None
+                lineage: dict[str, Any] = {}
+                sheet_name: str | None = None
+
+                def masked_chunks(
+                    selected_chunks=table_chunks, selected_policies=table_policies
+                ):
+                    nonlocal row_count, schema, lineage, sheet_name
+                    for table in selected_chunks:
+                        detected = detect_sensitive_columns(table.dataframe, sample_size=None)
+                        missing_policies = sorted(detected - set(selected_policies))
+                        if missing_policies:
+                            raise UnsafeIngestionError(
+                                "Sensitive columns require a masking policy: "
+                                + ", ".join(missing_policies)
+                            )
+                        masked, current_lineage = self.masking_service.mask_dataframe(
+                            tenant_id, table.dataframe, selected_policies
+                        )
+                        row_count += len(masked)
+                        schema = schema or self._schema(masked)
+                        lineage = current_lineage
+                        sheet_name = table.sheet_name
+                        yield masked
+
+                artifact_path = self.artifact_store.write_chunks(
+                    tenant_id, workspace_id, artifact_id, masked_chunks()
                 )
-            created.append(artifact)
+                created_paths.append(artifact_path)
+                pending.append(
+                    (
+                        ArtifactRecord(
+                            id=artifact_id,
+                            tenant_id=tenant_id,
+                            workspace_id=workspace_id,
+                            kind="dataset",
+                            name=logical_name,
+                            path=artifact_path,
+                            row_count=row_count,
+                            schema=schema or {"columns": []},
+                            lineage=lineage,
+                            parent_ids=(),
+                            created_at=utc_now(),
+                        ),
+                        sheet_name,
+                        table_policies,
+                    )
+                )
+
+            source.seek(0)
+            (
+                encrypted_path,
+                streamed_hash,
+                streamed_size,
+                encrypted_created,
+            ) = self.secure_file_store.write_stream(tenant_id, workspace_id, source)
+            if streamed_hash != content_hash or streamed_size != byte_size:
+                raise ValueError("Upload changed while it was being ingested.")
+        except Exception:
+            for path in created_paths:
+                path.unlink(missing_ok=True)
+            if encrypted_path is not None and encrypted_created:
+                encrypted_path.unlink(missing_ok=True)
+            raise
+
+        publication = [
+            (
+                artifact,
+                sheet_name,
+                {
+                    column_name: (
+                        policy.domain,
+                        policy.normalizer,
+                        self.masking_service.vault.key_version,
+                    )
+                    for column_name, policy in table_policies.items()
+                },
+            )
+            for artifact, sheet_name, table_policies in pending
+        ]
+        try:
+            file_record, lost_race = self.repository.publish_ingestion(
+                tenant_id,
+                workspace_id,
+                content_hash,
+                filename,
+                str(encrypted_path),
+                byte_size,
+                publication,
+            )
+        except Exception:
+            for path in created_paths:
+                path.unlink(missing_ok=True)
+            if encrypted_created:
+                encrypted_path.unlink(missing_ok=True)
+            raise
+        if lost_race:
+            for path in created_paths:
+                path.unlink(missing_ok=True)
+            if encrypted_created:
+                encrypted_path.unlink(missing_ok=True)
+            versions = self.repository.get_file_versions(tenant_id, file_record["id"])
+            artifacts = tuple(
+                self.repository.get_artifact(tenant_id, version["artifact_id"])
+                for version in versions
+            )
+            return IngestionResult(file_record["id"], content_hash, artifacts, True)
+
+        created = [artifact for artifact, _, _ in pending]
 
         self.repository.touch_workspace(tenant_id, workspace_id)
         self.repository.add_audit_event(
@@ -132,6 +221,17 @@ class IngestionService:
             {"sha256_prefix": content_hash[:12], "table_count": len(created)},
         )
         return IngestionResult(file_record["id"], content_hash, tuple(created), False)
+
+    @staticmethod
+    def _measure_and_hash(source: BinaryIO, chunk_size: int = 1024 * 1024) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        byte_size = 0
+        source.seek(0)
+        while chunk := source.read(chunk_size):
+            byte_size += len(chunk)
+            digest.update(chunk)
+        source.seek(0)
+        return byte_size, digest.hexdigest()
 
     @staticmethod
     def _schema(dataframe: Any) -> dict[str, Any]:

@@ -31,16 +31,16 @@ class MaskingService:
         masked = dataframe.copy()
         lineage: dict[str, ColumnLineage] = {}
         for column, policy in policies.items():
-            masked[column] = masked[column].map(
-                lambda value, selected_policy=policy: value
-                if self._is_null(value)
-                else self.vault.tokenize(
-                    tenant_id,
-                    selected_policy.domain,
-                    value,
-                    selected_policy.normalizer,
+            values = masked[column].tolist()
+            non_null_values = [value for value in values if not self._is_null(value)]
+            tokens = iter(
+                self.vault.tokenize_many(
+                    tenant_id, policy.domain, non_null_values, policy.normalizer
                 )
             )
+            masked[column] = [
+                value if self._is_null(value) else next(tokens) for value in values
+            ]
             lineage[column] = ColumnLineage(
                 domain=policy.domain,
                 normalizer=policy.normalizer,
@@ -58,10 +58,19 @@ class MaskingService:
         for column in lineage:
             if column not in restored.columns:
                 continue
+            tokens = list(
+                dict.fromkeys(
+                    value
+                    for value in restored[column]
+                    if isinstance(value, str) and not self._is_null(value)
+                )
+            )
+            values = self.vault.resolve_many(tenant_id, tokens)
+            replacements = dict(zip(tokens, values, strict=True))
             restored[column] = restored[column].map(
-                lambda value: value
-                if self._is_null(value) or not isinstance(value, str)
-                else self.vault.resolve(tenant_id, value)
+                lambda value, replacements=replacements: replacements.get(value, value)
+                if isinstance(value, str)
+                else value
             )
         return restored
 

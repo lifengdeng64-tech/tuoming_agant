@@ -61,3 +61,4 @@ def _column(dataframe: pd.DataFrame, name: str) -> pd.Series:
     if name not in dataframe.columns:
         raise ValueError(f"Column does not exist: {name}")
     return dataframe[name]
+

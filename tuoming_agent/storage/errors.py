@@ -8,3 +8,4 @@ class RecordNotFoundError(StorageError):
 
 class AuthorizationError(StorageError):
     """Raised when a tenant tries to access another tenant's record."""
+

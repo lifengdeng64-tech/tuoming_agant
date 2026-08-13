@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import html
-import io
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import streamlit as st
 
-from tuoming_agent.analysis.executor import AnalysisExecutionError, AnalysisExecutor
 from tuoming_agent.analysis.planner import SafeAnalysisPlanner
+from tuoming_agent.analysis.presentation import describe_plan
+from tuoming_agent.analysis.workflow import AnalysisWorkflowService, WorkflowSnapshot
 from tuoming_agent.config import AppConfig, ConfigurationError
+from tuoming_agent.exporting import ExportLimitError
+from tuoming_agent.ingestion.limits import validate_upload_size
+from tuoming_agent.ingestion.parser import preview_file
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
+from tuoming_agent.maintenance import DiskHeadroomError
 from tuoming_agent.security.dlp import SensitiveContentError
 from tuoming_agent.security.masking import ColumnPolicy
 from tuoming_agent.ui.styles import APP_STYLES
@@ -274,19 +279,21 @@ def _render_data_view(
         key=f"uploader-{workspace_id}",
         label_visibility="collapsed",
     )
-    prepared: list[tuple[str, bytes, dict[str, dict[str, ColumnPolicy]]]] = []
+    prepared: list[tuple[str, Any, dict[str, dict[str, ColumnPolicy]]]] = []
 
     for uploaded in uploaded_files or []:
-        content = uploaded.getvalue()
-        file_key = hashlib.sha256(content).hexdigest()[:12]
         try:
-            tables = services.ingestion.preview(uploaded.name, content)
+            validate_upload_size(uploaded.name, uploaded.size)
+            tables = preview_file(uploaded.name, uploaded)
         except ValueError as exc:
             st.error(f"{uploaded.name}: {exc}")
             continue
+        file_key = hashlib.sha256(
+            f"{uploaded.name}|{uploaded.size}".encode()
+        ).hexdigest()[:12]
         file_policies: dict[str, dict[str, ColumnPolicy]] = {}
         with st.expander(
-            f"{uploaded.name} · {_format_bytes(len(content))} · {len(tables)} 张表",
+            f"{uploaded.name} · {_format_bytes(uploaded.size)} · {len(tables)} 张表",
             expanded=True,
             icon=":material/draft:",
         ):
@@ -331,7 +338,7 @@ def _render_data_view(
                         use_container_width=True,
                         hide_index=True,
                     )
-        prepared.append((uploaded.name, content, file_policies))
+        prepared.append((uploaded.name, uploaded, file_policies))
 
     if prepared and st.button(
         f"确认并追加 {len(prepared)} 个文件",
@@ -341,14 +348,14 @@ def _render_data_view(
     ):
         try:
             results = [
-                services.ingestion.ingest(tenant_id, workspace_id, filename, content, policies)
-                for filename, content, policies in prepared
+                services.ingestion.ingest(tenant_id, workspace_id, filename, source, policies)
+                for filename, source, policies in prepared
             ]
             added = sum(not result.duplicate for result in results)
             duplicates = len(results) - added
             _set_flash("success", f"已追加 {added} 个文件，跳过 {duplicates} 个重复文件。")
             st.rerun()
-        except ValueError as exc:
+        except (DiskHeadroomError, ValueError) as exc:
             st.error(str(exc))
 
     st.divider()
@@ -439,9 +446,31 @@ def _render_analysis_view(
                     st.query_params["view"] = "结果"
                     st.rerun()
 
+    workflow = None
+    snapshot = None
+    if config.analyst_api_key:
+        planner = SafeAnalysisPlanner(
+            config.analyst_api_key,
+            config.analyst_base_url,
+            config.analyst_model_name,
+            services.conversations.sanitizer,
+        )
+        workflow = AnalysisWorkflowService(
+            services.repository,
+            services.artifacts,
+            planner,
+            config.analysis_max_repair_attempts,
+        )
+        snapshot = workflow.latest_for_conversation(tenant_id, workspace_id, conversation_id)
+        if snapshot:
+            _render_workflow_card(
+                services, workflow, snapshot, tenant_id, workspace_id, conversation_id
+            )
+
+    waiting = bool(snapshot and snapshot.run["status"] == "awaiting_confirmation")
     prompt = st.chat_input(
         "输入清洗、合并或分析要求",
-        disabled=not config.analyst_api_key,
+        disabled=not config.analyst_api_key or waiting,
     )
     if not prompt:
         return
@@ -456,28 +485,23 @@ def _render_analysis_view(
             conversation_id,
             preferred_artifact_id=source_id,
         )
-        planner = SafeAnalysisPlanner(
-            config.analyst_api_key,
-            config.analyst_base_url,
-            config.analyst_model_name,
-            services.conversations.sanitizer,
-        )
-        with st.spinner("正在生成并执行安全分析计划"):
-            plan = planner.create_plan(safe_request, context)
-            if plan.input_artifact_id != source_id:
-                raise AnalysisExecutionError("分析计划未使用选定的主数据源，已在本地阻止。")
-            services.conversations.sanitizer.assert_safe(f"{plan.result_name}\n{plan.safe_summary}")
-            artifact = AnalysisExecutor(services.artifacts).execute(tenant_id, workspace_id, plan)
-            services.conversations.add_assistant_message(
+        if workflow is None:
+            raise ValueError("分析模型未配置。")
+        with st.spinner("正在生成安全分析计划"):
+            created = workflow.start(
                 tenant_id,
+                workspace_id,
                 conversation_id,
-                plan.safe_summary,
-                artifact.id,
+                source_id,
+                safe_request,
+                context,
             )
-        st.session_state[f"result-selected-{workspace_id}"] = artifact.id
-        _set_flash("success", f"分析完成，已生成制品 {artifact.id[:8]}。")
+        if created.run["status"] == "awaiting_confirmation":
+            _set_flash("success", "计划已生成，请预览并确认后再执行。")
+        elif created.run["status"] == "security_blocked":
+            _set_flash("error", "计划触发安全拒绝，已阻止且不会自动修复。")
         st.rerun()
-    except (SensitiveContentError, AnalysisExecutionError, ValueError) as exc:
+    except (SensitiveContentError, ValueError) as exc:
         st.error(str(exc))
     except Exception:
         services.repository.add_audit_event(
@@ -487,6 +511,136 @@ def _render_analysis_view(
             {"source_artifact_id": source_id},
         )
         st.error("分析服务暂时不可用，请检查模型配置后重试。")
+
+
+def _render_workflow_card(
+    services: ApplicationServices,
+    workflow: AnalysisWorkflowService,
+    snapshot: WorkflowSnapshot,
+    tenant_id: str,
+    workspace_id: str,
+    conversation_id: str,
+) -> None:
+    status_labels = {
+        "planning": "正在规划",
+        "awaiting_confirmation": "等待确认",
+        "executing": "正在执行",
+        "validating": "正在校验",
+        "repairing": "正在生成修复计划",
+        "repairable_error": "可修复错误",
+        "completed": "已完成",
+        "rejected": "已拒绝",
+        "security_blocked": "安全阻止",
+        "failed": "失败",
+    }
+    status = snapshot.run["status"]
+    with st.container(border=True):
+        st.subheader(
+            f"分析运行 · {status_labels.get(status, status)}",
+            help=f"运行 ID：{snapshot.run['id']}",
+        )
+        st.caption(
+            f"计划版本 {snapshot.current_plan.version if snapshot.plan_versions else '-'} · "
+            f"已修复 {snapshot.run['repair_count']}/{snapshot.run['max_repairs']} 次"
+        )
+
+        if snapshot.plan_versions:
+            for line in describe_plan(snapshot.current_plan.plan):
+                st.markdown(f"- {line}")
+            if snapshot.current_plan.reason == "repair" and snapshot.run["error_message"]:
+                st.warning(f"上次执行未通过：{snapshot.run['error_message']}")
+
+        if len(snapshot.plan_versions) > 1 or snapshot.attempts:
+            decision_labels = {
+                "pending": "待确认",
+                "confirmed": "已确认",
+                "rejected": "已拒绝",
+                "superseded": "已被新版替代",
+            }
+            with st.expander("查看计划与执行历史"):
+                for version in reversed(snapshot.plan_versions):
+                    st.markdown(
+                        f"**计划 V{version.version}** · "
+                        f"{decision_labels.get(version.decision, version.decision)} · "
+                        f"来源：{version.reason}"
+                    )
+                for attempt in reversed(snapshot.attempts):
+                    detail = f" · {attempt.error_message}" if attempt.error_message else ""
+                    st.caption(
+                        f"执行 #{attempt.attempt_number}（计划 V{attempt.plan_version}）"
+                        f"：{attempt.status}{detail}"
+                    )
+
+        if status == "awaiting_confirmation":
+            confirm_col, reject_col = st.columns(2)
+            if confirm_col.button(
+                "确认并执行",
+                type="primary",
+                key=f"confirm-run-{snapshot.run['id']}",
+                use_container_width=True,
+            ):
+                with st.spinner("正在本地执行并进行质量校验"):
+                    result = workflow.confirm(tenant_id, snapshot.run["id"])
+                if result.run["status"] == "completed":
+                    artifact_id = result.run["result_artifact_id"]
+                    services.conversations.add_assistant_message(
+                        tenant_id,
+                        conversation_id,
+                        result.current_plan.plan.safe_summary,
+                        artifact_id,
+                    )
+                    st.session_state[f"result-selected-{workspace_id}"] = artifact_id
+                    _set_flash("success", f"分析完成，已生成制品 {artifact_id[:8]}。")
+                elif result.run["status"] == "awaiting_confirmation":
+                    _set_flash("error", "执行未通过，已生成修复计划，请重新确认。")
+                elif result.run["status"] == "security_blocked":
+                    _set_flash("error", "安全校验拒绝：已停止，未执行自动修复。")
+                else:
+                    _set_flash("error", result.run["error_message"] or "分析执行失败。")
+                st.rerun()
+            if reject_col.button(
+                "拒绝计划",
+                key=f"reject-run-{snapshot.run['id']}",
+                use_container_width=True,
+            ):
+                workflow.reject(tenant_id, snapshot.run["id"])
+                _set_flash("success", "计划已拒绝，没有执行任何数据操作。")
+                st.rerun()
+
+            with st.form(f"revise-run-{snapshot.run['id']}"):
+                feedback = st.text_area(
+                    "修改意见", placeholder="例如：只保留最近 30 天，并按门店汇总"
+                )
+                submitted = st.form_submit_button("根据意见生成新版计划")
+            if submitted and feedback.strip():
+                safe_feedback = services.conversations.sanitizer.sanitize(
+                    tenant_id, feedback.strip()
+                )
+                context = services.conversations.build_safe_context(
+                    tenant_id,
+                    workspace_id,
+                    conversation_id,
+                    preferred_artifact_id=snapshot.run["source_artifact_id"],
+                )
+                with st.spinner("正在生成新版计划"):
+                    workflow.revise(
+                        tenant_id, snapshot.run["id"], safe_feedback, context
+                    )
+                _set_flash("success", "新版计划已生成，请再次确认。")
+                st.rerun()
+
+        elif status == "completed":
+            st.success(f"质量校验通过，制品 {snapshot.run['result_artifact_id'][:8]} 已保存。")
+            latest_attempt = snapshot.attempts[-1] if snapshot.attempts else None
+            if latest_attempt and latest_attempt.quality_report:
+                for warning in latest_attempt.quality_report.warnings:
+                    st.warning(warning.message)
+        elif status == "security_blocked":
+            st.error(f"安全拒绝（不会自动修复）：{snapshot.run['error_message']}")
+        elif status == "failed":
+            st.error(snapshot.run["error_message"] or "分析运行失败。")
+        elif status == "rejected":
+            st.info("计划已由用户拒绝，未执行。")
 
 
 def _render_results_view(
@@ -530,12 +684,12 @@ def _render_results_view(
         format_func=lambda artifact_id: _artifact_option(artifact_by_id[artifact_id]),
     )
     st.session_state[f"result-selected-{workspace_id}"] = selected_id
-    artifact, masked = services.artifacts.load(tenant_id, selected_id)
+    artifact = artifact_by_id[selected_id]
 
     info_columns = st.columns(4)
     info_columns[0].metric("类型", _artifact_kind(artifact.kind), border=True)
     info_columns[1].metric("行数", f"{artifact.row_count:,}", border=True)
-    info_columns[2].metric("字段", len(masked.columns), border=True)
+    info_columns[2].metric("字段", len(artifact.schema.get("columns", [])), border=True)
     info_columns[3].metric("脱敏字段", len(artifact.lineage), border=True)
 
     mode = (
@@ -546,28 +700,14 @@ def _render_results_view(
         )
         or "脱敏预览"
     )
-    restored = services.masking.unmask_dataframe(tenant_id, masked, artifact.lineage)
-    visible = masked if mode == "脱敏预览" else restored
-    st.dataframe(visible.head(1000), use_container_width=True, hide_index=True, height=430)
+    visible = services.artifacts.preview(
+        tenant_id, selected_id, restored=mode == "授权还原"
+    )
+    st.dataframe(visible, use_container_width=True, hide_index=True, height=430)
+    st.caption("预览最多读取 1,000 行；下载文件仅在选择格式并准备后生成。")
 
-    safe_col, restored_col, detail_col = st.columns([1, 1, 2], vertical_alignment="bottom")
-    safe_col.download_button(
-        "下载脱敏版",
-        data=_to_excel(masked),
-        file_name=f"masked-{artifact.id[:8]}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        icon=":material/download:",
-        use_container_width=True,
-    )
-    restored_col.download_button(
-        "下载还原版",
-        data=_to_excel(restored),
-        file_name=f"restored-{artifact.id[:8]}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        icon=":material/lock_open:",
-        use_container_width=True,
-    )
-    detail_col.caption(f"制品 ID {artifact.id} · 生成于 {_format_timestamp(artifact.created_at)}")
+    _render_export_controls(services, tenant_id, workspace_id, artifact)
+    st.caption(f"制品 ID {artifact.id} · 生成于 {_format_timestamp(artifact.created_at)}")
 
     with st.expander("制品详情", icon=":material/account_tree:"):
         detail_left, detail_right = st.columns(2, gap="large")
@@ -600,6 +740,98 @@ def _render_results_view(
         st.caption(f"来源制品：{', '.join(artifact.parent_ids) or '加密上传文件'}")
 
 
+def _render_export_controls(
+    services: ApplicationServices,
+    tenant_id: str,
+    workspace_id: str,
+    artifact: Any,
+) -> None:
+    format_label = st.selectbox(
+        "下载格式",
+        ("CSV", "Parquet", "Excel"),
+        help="Excel 仅适用于不超过 100,000 行且估算数据量不超过 50 MiB 的结果。",
+    )
+    format_name = {"CSV": "csv", "Parquet": "parquet", "Excel": "xlsx"}[format_label]
+    state_key = f"prepared-export-{workspace_id}"
+    prepared = st.session_state.get(state_key)
+    if prepared and prepared["artifact_id"] != artifact.id:
+        _cleanup_prepared_export(prepared)
+        st.session_state.pop(state_key, None)
+        prepared = None
+
+    safe_col, restored_col = st.columns(2)
+    if safe_col.button(
+        "准备脱敏下载",
+        icon=":material/download:",
+        use_container_width=True,
+    ):
+        _prepare_export(
+            services, tenant_id, artifact, format_name, False, state_key, prepared
+        )
+    if restored_col.button(
+        "准备还原下载",
+        icon=":material/lock_open:",
+        disabled=format_name == "parquet",
+        help="还原版使用血缘逐块恢复；请选择 CSV 或小型 Excel。",
+        use_container_width=True,
+    ):
+        _prepare_export(
+            services, tenant_id, artifact, format_name, True, state_key, prepared
+        )
+
+    prepared = st.session_state.get(state_key)
+    if not prepared:
+        return
+    path = Path(prepared["path"])
+    if not path.is_file():
+        st.session_state.pop(state_key, None)
+        st.warning("已准备的下载文件已过期，请重新准备。")
+        return
+    with path.open("rb") as stream:
+        st.download_button(
+            "下载已准备文件",
+            data=stream,
+            file_name=prepared["file_name"],
+            mime=prepared["mime"],
+            on_click="ignore",
+            icon=":material/download:",
+            type="primary",
+            use_container_width=True,
+        )
+
+
+def _prepare_export(
+    services: ApplicationServices,
+    tenant_id: str,
+    artifact: Any,
+    format_name: str,
+    restored: bool,
+    state_key: str,
+    previous: dict[str, Any] | None,
+) -> None:
+    try:
+        exported = services.artifacts.export(
+            tenant_id, artifact.id, format_name, restored=restored
+        )
+    except (ExportLimitError, ValueError) as exc:
+        st.error(str(exc))
+        return
+    if previous:
+        _cleanup_prepared_export(previous)
+    st.session_state[state_key] = {
+        "artifact_id": artifact.id,
+        "path": str(exported.path),
+        "file_name": exported.file_name,
+        "mime": exported.mime,
+        "temporary": exported.temporary,
+    }
+
+
+def _cleanup_prepared_export(prepared: dict[str, Any]) -> None:
+    if prepared.get("temporary"):
+        Path(prepared["path"]).unlink(missing_ok=True)
+
+
 def _policy_frame(dataframe: pd.DataFrame, detected: set[str]) -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -613,13 +845,6 @@ def _policy_frame(dataframe: pd.DataFrame, detected: set[str]) -> pd.DataFrame:
             for column in dataframe.columns
         ]
     )
-
-
-def _to_excel(dataframe: pd.DataFrame) -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        dataframe.to_excel(writer, index=False, sheet_name="Result")
-    return buffer.getvalue()
 
 
 def _default_domain(column: str) -> str:

@@ -106,3 +106,4 @@ def test_detected_sensitive_column_fails_closed_before_persistence(services, wor
         )
         is None
     )
+

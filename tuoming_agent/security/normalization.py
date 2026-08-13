@@ -33,3 +33,4 @@ def normalize_domain(domain: str) -> str:
     if not normalized:
         raise ValueError("Masking domain must contain letters or numbers.")
     return normalized[:32]
+

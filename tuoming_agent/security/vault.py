@@ -98,12 +98,132 @@ class TokenVault:
                     return str(concurrent["token"])
         raise TokenCollisionError("Unable to create a unique deterministic token.")
 
+    def tokenize_many(
+        self,
+        tenant_id: str,
+        domain: str,
+        values: list[Any],
+        normalizer: str = "text",
+        key_version: int | None = None,
+    ) -> list[str]:
+        """Tokenize a batch using one SQLite transaction and one tenant check."""
+        if not values:
+            return []
+        self.repository.ensure_tenant(tenant_id)
+        connect = getattr(self.repository, "_connect", None)
+        if connect is None:
+            return [
+                self.tokenize(tenant_id, domain, value, normalizer, key_version)
+                for value in values
+            ]
+
+        version = key_version or self.key_version
+        safe_domain = normalize_domain(domain)
+        token_key = derive_key(self.master_key, "token", tenant_id)
+        prepared: list[str] = []
+        unique: dict[str, tuple[bytes, Any]] = {}
+        for value in values:
+            normalized = normalize_value(value, normalizer)
+            payload = json.dumps(
+                {
+                    "tenant_scope": tenant_id,
+                    "masking_domain": safe_domain,
+                    "normalized_value": normalized,
+                    "key_version": version,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode()
+            digest = hmac.new(token_key, payload, hashlib.sha256).digest()
+            fingerprint = digest.hex()
+            prepared.append(fingerprint)
+            unique.setdefault(fingerprint, (digest, value))
+
+        tokens: dict[str, str] = {}
+        with connect() as connection:
+            fingerprints = list(unique)
+            for offset in range(0, len(fingerprints), 900):
+                batch = fingerprints[offset : offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""SELECT fingerprint, token FROM token_mappings
+                    WHERE tenant_id = ? AND domain = ? AND key_version = ?
+                    AND fingerprint IN ({placeholders})""",
+                    (tenant_id, safe_domain, version, *batch),
+                ).fetchall()
+                tokens.update(
+                    {str(row["fingerprint"]): str(row["token"]) for row in rows}
+                )
+
+            for fingerprint, (digest, value) in unique.items():
+                if fingerprint in tokens:
+                    continue
+                for byte_length in (10, 12, 16, 20, 24, 28, 32):
+                    token = self._candidate_token(safe_domain, version, digest, byte_length)
+                    nonce, encrypted = self._encrypt_value(
+                        tenant_id, safe_domain, version, token, value
+                    )
+                    connection.execute(
+                        """INSERT OR IGNORE INTO token_mappings(
+                            tenant_id, domain, key_version, fingerprint, token,
+                            encrypted_value, nonce, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            tenant_id,
+                            safe_domain,
+                            version,
+                            fingerprint,
+                            token,
+                            encrypted,
+                            nonce,
+                            utc_now(),
+                        ),
+                    )
+                    row = connection.execute(
+                        """SELECT token FROM token_mappings
+                        WHERE tenant_id = ? AND domain = ?
+                        AND key_version = ? AND fingerprint = ?""",
+                        (tenant_id, safe_domain, version, fingerprint),
+                    ).fetchone()
+                    if row:
+                        tokens[fingerprint] = str(row["token"])
+                        break
+                else:
+                    raise TokenCollisionError("Unable to create a unique deterministic token.")
+        return [tokens[fingerprint] for fingerprint in prepared]
+
     def resolve(self, tenant_id: str, token: str) -> Any:
         mapping = self.repository.find_mapping_by_token(tenant_id, token)
         if mapping is None:
             # Check whether the token exists elsewhere without disclosing its owner.
             raise RecordNotFoundError("Token not found for this tenant.")
         return self._decrypt_mapping(mapping)
+
+    def resolve_many(self, tenant_id: str, tokens: list[str]) -> list[Any]:
+        """Resolve one bounded token batch with batched SQLite reads."""
+        if not tokens:
+            return []
+        connect = getattr(self.repository, "_connect", None)
+        if connect is None:
+            return [self.resolve(tenant_id, token) for token in tokens]
+        unique = list(dict.fromkeys(tokens))
+        mappings: dict[str, dict[str, Any]] = {}
+        with connect() as connection:
+            for offset in range(0, len(unique), 900):
+                batch = unique[offset : offset + 900]
+                placeholders = ",".join("?" for _ in batch)
+                rows = connection.execute(
+                    f"""SELECT * FROM token_mappings
+                    WHERE tenant_id = ? AND token IN ({placeholders})""",
+                    (tenant_id, *batch),
+                ).fetchall()
+                mappings.update({str(row["token"]): dict(row) for row in rows})
+        missing = next((token for token in unique if token not in mappings), None)
+        if missing is not None:
+            raise RecordNotFoundError("Token not found for this tenant.")
+        resolved = {token: self._decrypt_mapping(mappings[token]) for token in unique}
+        return [resolved[token] for token in tokens]
 
     def iter_plaintext_tokens(self, tenant_id: str) -> Iterator[tuple[str, str]]:
         for mapping in self.repository.list_mappings(tenant_id):
