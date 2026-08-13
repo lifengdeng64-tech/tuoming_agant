@@ -535,6 +535,10 @@ class SQLiteRepository:
             actual = self._inspect_file_deletion(
                 connection, tenant_id, workspace_id, impact.file_id
             )
+            if actual != impact:
+                raise RuntimeError(
+                    "Data source dependencies changed during deletion; inspect and confirm again."
+                )
             self._delete_ids(
                 connection,
                 "analysis_plan_versions",

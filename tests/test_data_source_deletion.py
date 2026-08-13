@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -154,3 +156,58 @@ def test_delete_file_metadata_rolls_back_when_file_delete_fails(services, worksp
 
     assert len(services.repository.list_files("tenant-a", workspace.id)) == 1
     assert len(services.repository.list_artifacts("tenant-a", workspace.id)) == 3
+
+
+def test_data_source_service_removes_files_and_metadata(services, workspace):
+    ingested, source, direct, descendant, *_ = _source_graph(services, workspace)
+    impact = services.data_sources.inspect("tenant-a", workspace.id, ingested.file_id)
+    original_paths = tuple(impact.paths)
+
+    deleted = services.data_sources.delete("tenant-a", workspace.id, ingested.file_id)
+
+    assert deleted.artifact_count == 3
+    assert all(not path.exists() for path in original_paths)
+    assert services.repository.list_files("tenant-a", workspace.id) == []
+    assert not (services.data_sources.data_dir / ".trash").exists()
+    assert not source.path.exists()
+    assert not direct.path.exists()
+    assert not descendant.path.exists()
+
+
+def test_data_source_service_restores_files_when_metadata_delete_fails(
+    monkeypatch, services, workspace
+):
+    ingested, *_ = _source_graph(services, workspace)
+    impact = services.data_sources.inspect("tenant-a", workspace.id, ingested.file_id)
+    original = {path: path.read_bytes() for path in impact.paths}
+
+    def fail_delete(*_args, **_kwargs):
+        raise sqlite3.IntegrityError("metadata unavailable")
+
+    monkeypatch.setattr(services.repository, "delete_file_metadata", fail_delete)
+
+    with pytest.raises(sqlite3.IntegrityError, match="metadata unavailable"):
+        services.data_sources.delete("tenant-a", workspace.id, ingested.file_id)
+
+    assert {path: path.read_bytes() for path in impact.paths} == original
+    assert not (services.data_sources.data_dir / ".trash").exists()
+    assert len(services.repository.list_files("tenant-a", workspace.id)) == 1
+
+
+def test_data_source_service_rejects_database_path_outside_data_dir(
+    monkeypatch, services, workspace, tmp_path: Path
+):
+    ingested, *_ = _source_graph(services, workspace)
+    impact = services.repository.inspect_file_deletion(
+        "tenant-a", workspace.id, ingested.file_id
+    )
+    outside = tmp_path / "outside.enc"
+    outside.write_bytes(b"outside")
+    unsafe = replace(impact, paths=(*impact.paths, outside))
+    monkeypatch.setattr(services.repository, "inspect_file_deletion", lambda *_args: unsafe)
+
+    with pytest.raises(ValueError, match="data directory"):
+        services.data_sources.delete("tenant-a", workspace.id, ingested.file_id)
+
+    assert outside.read_bytes() == b"outside"
+    assert all(path.exists() for path in impact.paths)

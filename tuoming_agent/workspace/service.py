@@ -17,6 +17,7 @@ from tuoming_agent.security.masking import MaskingService
 from tuoming_agent.security.vault import TokenVault
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
 from tuoming_agent.storage.sqlite import SQLiteRepository
+from tuoming_agent.workspace.data_sources import DataSourceService
 
 
 class ArtifactService:
@@ -275,6 +276,7 @@ class ApplicationServices:
     ingestion: IngestionService
     artifacts: ArtifactService
     conversations: ConversationService
+    data_sources: DataSourceService
 
 
 def create_services(config: AppConfig) -> ApplicationServices:
@@ -299,4 +301,5 @@ def create_services(config: AppConfig) -> ApplicationServices:
         ),
         artifacts=artifacts,
         conversations=ConversationService(repository, sanitizer),
+        data_sources=DataSourceService(repository, config.data_dir),
     )
