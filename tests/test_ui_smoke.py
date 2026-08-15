@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -8,7 +9,165 @@ from streamlit.testing.v1 import AppTest
 
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.config import AppConfig
+from tuoming_agent.storage.sqlite import TableDeletionImpact
+from tuoming_agent.ui import app as ui_app
 from tuoming_agent.workspace.service import create_services
+
+
+class _EmptyContainer:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
+def test_upload_button_uses_confirm_add_label(monkeypatch):
+    class AcceptedUpload(BytesIO):
+        name = "accepted.csv"
+        size = len(b"value\n1\n")
+
+    labels: list[str] = []
+    monkeypatch.setattr(
+        ui_app.st,
+        "file_uploader",
+        lambda *_args, **_kwargs: [AcceptedUpload(b"value\n1\n")],
+    )
+    monkeypatch.setattr(ui_app.st, "expander", lambda *_args, **_kwargs: _EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "data_editor", lambda frame, **_kwargs: frame)
+    monkeypatch.setattr(ui_app.st, "dataframe", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "markdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "divider", lambda: None)
+    monkeypatch.setattr(
+        ui_app.st,
+        "columns",
+        lambda *_args, **_kwargs: [_EmptyContainer(), _EmptyContainer()],
+    )
+
+    def button(label, **_kwargs):
+        labels.append(label)
+        return False
+
+    monkeypatch.setattr(ui_app.st, "button", button)
+    monkeypatch.setattr(ui_app, "_section_heading", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app, "_empty_state", lambda *_args, **_kwargs: None)
+
+    ui_app._render_data_view(object(), "tenant", "workspace", [], [])
+
+    assert "确认添加" in labels
+    assert not any(label.startswith("确认并追加") for label in labels)
+
+
+def test_table_deletion_requires_acknowledgement_for_related_analysis(monkeypatch):
+    impact = TableDeletionImpact(
+        dataset_version_id="version-a",
+        dataset_id="dataset-a",
+        file_id="file-a",
+        logical_name="book::page",
+        version=1,
+        row_count=643,
+        artifact_ids=("source-a", "result-a"),
+        analysis_run_ids=("run-a",),
+        paths=(Path("source.parquet"), Path("result.parquet")),
+    )
+
+    class DataSources:
+        deleted = False
+
+        def inspect_table(self, *_args):
+            return impact
+
+        def delete_table(self, *_args):
+            self.deleted = True
+
+    class Services:
+        data_sources = DataSources()
+
+    warnings: list[str] = []
+    disabled: list[bool] = []
+    state = {"pending-table-delete-workspace": "version-a"}
+    monkeypatch.setattr(ui_app.st, "session_state", state)
+    monkeypatch.setattr(ui_app.st, "warning", warnings.append)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "checkbox", lambda *_args, **_kwargs: False)
+
+    def button(label, **kwargs):
+        if label == "确认删除工作表":
+            disabled.append(kwargs["disabled"])
+        return False
+
+    monkeypatch.setattr(ui_app.st, "button", button)
+
+    ui_app._render_dataset_version_deletion(
+        Services(),
+        "tenant",
+        "workspace",
+        {
+            "dataset_version_id": "version-a",
+            "logical_name": "book::page",
+            "version": 1,
+            "row_count": 643,
+        },
+    )
+
+    assert disabled == [True]
+    assert Services.data_sources.deleted is False
+    assert any("book::page" in warning and "643" in warning for warning in warnings)
+
+
+def test_confirmed_table_deletion_calls_service_and_refreshes(monkeypatch):
+    impact = TableDeletionImpact(
+        dataset_version_id="version-a",
+        dataset_id="dataset-a",
+        file_id="file-a",
+        logical_name="book::page",
+        version=1,
+        row_count=643,
+        artifact_ids=("source-a",),
+        analysis_run_ids=(),
+        paths=(Path("source.parquet"),),
+    )
+    deleted: list[tuple[str, str, str]] = []
+
+    class DataSources:
+        def inspect_table(self, *_args):
+            return impact
+
+        def delete_table(self, *args):
+            deleted.append(args)
+            return impact
+
+    class Services:
+        data_sources = DataSources()
+
+    state = {"pending-table-delete-workspace": "version-a"}
+    monkeypatch.setattr(ui_app.st, "session_state", state)
+    monkeypatch.setattr(ui_app.st, "warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "checkbox", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        ui_app.st,
+        "button",
+        lambda label, **_kwargs: label == "确认删除工作表",
+    )
+    monkeypatch.setattr(ui_app.st, "rerun", lambda: None)
+    monkeypatch.setattr(ui_app, "_set_flash", lambda *_args, **_kwargs: None)
+
+    ui_app._render_dataset_version_deletion(
+        Services(),
+        "tenant",
+        "workspace",
+        {
+            "dataset_version_id": "version-a",
+            "logical_name": "book::page",
+            "version": 1,
+            "row_count": 643,
+        },
+    )
+
+    assert deleted == [("tenant", "workspace", "version-a")]
+    assert "pending-table-delete-workspace" not in state
 
 
 def test_streamlit_workspace_renders_without_runtime_errors(monkeypatch, tmp_path: Path):

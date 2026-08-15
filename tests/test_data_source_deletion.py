@@ -176,6 +176,19 @@ def test_inspect_dataset_version_deletion_rejects_cross_tenant(services, workspa
     assert services.repository.get_artifact("tenant-a", graph["source"].id)
 
 
+def test_list_datasets_exposes_current_version_identity_and_row_count(
+    services, workspace
+):
+    graph = _two_sheet_graph(services, workspace)
+
+    datasets = services.repository.list_datasets("tenant-a", workspace.id)
+    page = next(row for row in datasets if row["logical_name"] == "book::page")
+
+    assert page["dataset_version_id"] == graph["target_version"]["id"]
+    assert page["file_id"] == graph["ingested"].file_id
+    assert page["row_count"] == 2
+
+
 def test_inspect_file_deletion_rejects_cross_tenant_without_mutation(services, workspace):
     ingested, *_ = _source_graph(services, workspace)
     services.repository.ensure_tenant("tenant-b")

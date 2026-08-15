@@ -346,7 +346,7 @@ def _render_data_view(
         prepared.append((uploaded.name, uploaded, file_policies, file_retained))
 
     if prepared and st.button(
-        f"确认并追加 {len(prepared)} 个文件",
+        "确认添加",
         type="primary",
         icon=":material/upload_file:",
         use_container_width=False,
@@ -380,6 +380,7 @@ def _render_data_view(
                     {
                         "数据集": item["logical_name"],
                         "版本": f"V{item['version']}",
+                        "行数": item["row_count"],
                         "制品 ID": str(item["artifact_id"])[:8],
                         "更新时间": _format_timestamp(item["version_created_at"]),
                     }
@@ -387,6 +388,27 @@ def _render_data_view(
                 ]
             )
             st.dataframe(dataset_table, use_container_width=True, hide_index=True)
+            for dataset in datasets:
+                action_col, delete_col = st.columns([4, 1], vertical_alignment="center")
+                action_col.caption(
+                    f"{dataset['logical_name']} · V{dataset['version']} · "
+                    f"{dataset['row_count']:,} 行"
+                )
+                if delete_col.button(
+                    "删除工作表",
+                    key=(
+                        f"delete-table-{workspace_id}-"
+                        f"{dataset['dataset_version_id']}"
+                    ),
+                    use_container_width=True,
+                ):
+                    st.session_state[f"pending-table-delete-{workspace_id}"] = dataset[
+                        "dataset_version_id"
+                    ]
+                    st.rerun()
+                _render_dataset_version_deletion(
+                    services, tenant_id, workspace_id, dataset
+                )
         else:
             _empty_state("暂无数据集", "数据")
     with file_col:
@@ -421,6 +443,65 @@ def _render_data_view(
                 )
         else:
             _empty_state("暂无上传记录", "文件")
+
+
+def _render_dataset_version_deletion(
+    services: Any,
+    tenant_id: str,
+    workspace_id: str,
+    dataset: dict[str, Any],
+) -> None:
+    state_key = f"pending-table-delete-{workspace_id}"
+    dataset_version_id = dataset["dataset_version_id"]
+    if st.session_state.get(state_key) != dataset_version_id:
+        return
+    try:
+        impact = services.data_sources.inspect_table(
+            tenant_id, workspace_id, dataset_version_id
+        )
+    except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
+        st.warning(f"无法检查工作表删除影响：{exc}")
+        return
+
+    has_dependencies = impact.analysis_run_count > 0 or impact.artifact_count > 1
+    st.warning(
+        f"将删除工作表 {impact.logical_name} V{impact.version}（{impact.row_count:,} 行）、"
+        f"{impact.artifact_count} 个本地制品和 "
+        f"{impact.analysis_run_count} 个关联分析。聊天文字会保留。"
+    )
+    acknowledged = True
+    if has_dependencies:
+        acknowledged = st.checkbox(
+            "我了解关联分析和结果也会删除",
+            key=f"ack-table-delete-{workspace_id}-{dataset_version_id}",
+        )
+    st.caption("加密原文件和同一文件的其他工作表会保留；该操作不能撤销。")
+    if st.button(
+        "确认删除工作表",
+        key=f"confirm-table-delete-{workspace_id}-{dataset_version_id}",
+        type="primary",
+        disabled=not acknowledged,
+    ):
+        try:
+            deleted = services.data_sources.delete_table(
+                tenant_id, workspace_id, dataset_version_id
+            )
+        except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
+            st.warning(f"删除失败，原数据已保留：{exc}")
+            return
+        st.session_state.pop(state_key, None)
+        _set_flash(
+            "success",
+            f"已删除工作表 {deleted.logical_name} 及 "
+            f"{deleted.artifact_count - 1} 个关联制品。",
+        )
+        st.rerun()
+    if st.button(
+        "取消",
+        key=f"cancel-table-delete-{workspace_id}-{dataset_version_id}",
+    ):
+        st.session_state.pop(state_key, None)
+        st.rerun()
 
 
 def _render_file_deletion(

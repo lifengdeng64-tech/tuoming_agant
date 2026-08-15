@@ -1080,13 +1080,15 @@ class SQLiteRepository:
         self.get_workspace(tenant_id, workspace_id)
         with self._connect() as connection:
             rows = connection.execute(
-                """SELECT d.*, dv.version, dv.artifact_id, dv.sheet_name,
+                """SELECT d.*, dv.id AS dataset_version_id, dv.file_id,
+                    dv.version, dv.artifact_id, dv.sheet_name, a.row_count,
                     dv.created_at AS version_created_at
                 FROM datasets d
                 LEFT JOIN dataset_versions dv ON dv.id = (
                     SELECT id FROM dataset_versions
                     WHERE dataset_id = d.id ORDER BY version DESC LIMIT 1
                 )
+                LEFT JOIN artifacts a ON a.id = dv.artifact_id
                 WHERE d.tenant_id = ? AND d.workspace_id = ?
                 ORDER BY d.logical_name""",
                 (tenant_id, workspace_id),
