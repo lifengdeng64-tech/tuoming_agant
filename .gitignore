@@ -20,3 +20,5 @@ temp_result.csv
 venv/
 .venv/
 
+# Isolated feature worktrees
+.worktrees/
