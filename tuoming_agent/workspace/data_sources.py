@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import stat
 import uuid
+from collections.abc import Callable
 from pathlib import Path
+from typing import TypeVar
 
-from tuoming_agent.storage.sqlite import DeletionImpact, SQLiteRepository
+from tuoming_agent.storage.sqlite import (
+    DeletionImpact,
+    SQLiteRepository,
+    TableDeletionImpact,
+)
+
+T = TypeVar("T")
 
 
 class DataSourceService:
@@ -21,7 +29,35 @@ class DataSourceService:
         self, tenant_id: str, workspace_id: str, file_id: str
     ) -> DeletionImpact:
         impact = self.inspect(tenant_id, workspace_id, file_id)
-        paths = tuple(self._validate_path(path) for path in impact.paths)
+        return self._delete_paths(
+            impact.paths,
+            lambda: self.repository.delete_file_metadata(
+                tenant_id, workspace_id, impact
+            ),
+        )
+
+    def inspect_table(
+        self, tenant_id: str, workspace_id: str, dataset_version_id: str
+    ) -> TableDeletionImpact:
+        return self.repository.inspect_dataset_version_deletion(
+            tenant_id, workspace_id, dataset_version_id
+        )
+
+    def delete_table(
+        self, tenant_id: str, workspace_id: str, dataset_version_id: str
+    ) -> TableDeletionImpact:
+        impact = self.inspect_table(tenant_id, workspace_id, dataset_version_id)
+        return self._delete_paths(
+            impact.paths,
+            lambda: self.repository.delete_dataset_version_metadata(
+                tenant_id, workspace_id, impact
+            ),
+        )
+
+    def _delete_paths(
+        self, paths: tuple[Path, ...], metadata_delete: Callable[[], T]
+    ) -> T:
+        paths = tuple(self._validate_path(path) for path in paths)
         operation_dir = self.data_dir / ".trash" / str(uuid.uuid4())
         staged: list[tuple[Path, Path]] = []
         try:
@@ -30,9 +66,7 @@ class DataSourceService:
                 temporary = operation_dir / f"{index:04d}-{original.name}"
                 original.replace(temporary)
                 staged.append((original, temporary))
-            deleted = self.repository.delete_file_metadata(
-                tenant_id, workspace_id, impact
-            )
+            deleted = metadata_delete()
         except Exception:
             for original, temporary in reversed(staged):
                 if temporary.exists():
