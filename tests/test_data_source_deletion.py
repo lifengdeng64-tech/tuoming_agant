@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
 from tuoming_agent.storage.sqlite import DeletionImpact
 from tuoming_agent.workspace.data_sources import DataSourceDeletionError
@@ -159,6 +160,418 @@ def test_inspect_file_deletion_finds_all_descendants_and_analysis(services, work
     assert impact.dataset_version_count == 1
 
 
+def test_file_deletion_selects_and_removes_only_associated_messages(
+    services, workspace
+):
+    first = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "first.csv",
+        pd.DataFrame({"value": [1]}).to_csv(index=False).encode(),
+        {"first": {}},
+    )
+    second = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "second.csv",
+        pd.DataFrame({"value": [2]}).to_csv(index=False).encode(),
+        {"second": {}},
+    )
+    conversation = services.repository.get_or_create_conversation(
+        "tenant-a", workspace.id
+    )
+
+    first_request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "analyze first"
+    )
+    first_run = services.repository.create_analysis_run(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        first.artifacts[0].id,
+        first_request.safe_content,
+        {},
+        3,
+        request_message_id=first_request.id,
+    )
+    first_result = services.artifacts.save_result(
+        "tenant-a",
+        workspace.id,
+        "first result",
+        pd.DataFrame({"value": [1]}),
+        {},
+        (first.artifacts[0].id,),
+    )
+    services.conversations.add_assistant_message(
+        "tenant-a",
+        conversation["id"],
+        "first ready",
+        first_result.id,
+        analysis_run_id=first_run["id"],
+    )
+    first_response = services.repository.list_messages(
+        "tenant-a", conversation["id"], 100
+    )[-1]
+
+    second_request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "analyze second"
+    )
+    second_run = services.repository.create_analysis_run(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        second.artifacts[0].id,
+        second_request.safe_content,
+        {},
+        3,
+        request_message_id=second_request.id,
+    )
+    second_result = services.artifacts.save_result(
+        "tenant-a",
+        workspace.id,
+        "second result",
+        pd.DataFrame({"value": [2]}),
+        {},
+        (second.artifacts[0].id,),
+    )
+    services.conversations.add_assistant_message(
+        "tenant-a",
+        conversation["id"],
+        "second ready",
+        second_result.id,
+        analysis_run_id=second_run["id"],
+    )
+    second_response = services.repository.list_messages(
+        "tenant-a", conversation["id"], 100
+    )[-1]
+    services.repository.update_conversation_summary(
+        "tenant-a", conversation["id"], "stale summary"
+    )
+
+    impact = services.repository.inspect_file_deletion(
+        "tenant-a", workspace.id, first.file_id
+    )
+
+    assert set(impact.message_ids) == {first_request.id, first_response.id}
+    assert impact.message_count == 2
+    assert second_request.id not in impact.message_ids
+
+    services.data_sources.delete("tenant-a", workspace.id, first.file_id)
+
+    remaining = services.repository.list_messages(
+        "tenant-a", conversation["id"], 100
+    )
+    assert [message.id for message in remaining] == [
+        second_request.id,
+        second_response.id,
+    ]
+    assert (
+        services.repository.get_conversation("tenant-a", conversation["id"])[
+            "safe_summary"
+        ]
+        == ""
+    )
+
+
+def test_inspect_file_deletion_finds_pending_merge_source_messages(
+    services, workspace
+):
+    left = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "left.csv",
+        pd.DataFrame({"key": [1]}).to_csv(index=False).encode(),
+        {"left": {}},
+    )
+    right = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "right.csv",
+        pd.DataFrame({"key": [1]}).to_csv(index=False).encode(),
+        {"right": {}},
+    )
+    conversation = services.repository.get_or_create_conversation(
+        "tenant-a", workspace.id
+    )
+    request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "merge the sources"
+    )
+    run = services.repository.create_analysis_run(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        left.artifacts[0].id,
+        request.safe_content,
+        {},
+        3,
+        request_message_id=request.id,
+    )
+    plan = AnalysisPlan(
+        input_artifact_id=left.artifacts[0].id,
+        operations=[
+            {
+                "action": "merge",
+                "right_artifact_id": right.artifacts[0].id,
+                "left_on": ["key"],
+                "right_on": ["key"],
+            }
+        ],
+    )
+    services.repository.create_analysis_plan_version(
+        "tenant-a", run["id"], plan.model_dump(mode="json"), "initial"
+    )
+
+    impact = services.repository.inspect_file_deletion(
+        "tenant-a", workspace.id, right.file_id
+    )
+
+    assert impact.analysis_run_ids == (run["id"],)
+    assert impact.message_ids == (request.id,)
+
+
+def test_file_deletion_excludes_cross_workspace_artifact_message(
+    services, workspace
+):
+    ingested = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "scoped.csv",
+        pd.DataFrame({"value": [1]}).to_csv(index=False).encode(),
+        {"scoped": {}},
+    )
+    other_workspace = services.repository.create_workspace("tenant-a", "other")
+    other_conversation = services.repository.create_conversation(
+        "tenant-a", other_workspace.id
+    )
+    unrelated = services.repository.add_message(
+        "tenant-a",
+        other_conversation["id"],
+        "assistant",
+        "keep cross-workspace message",
+        ingested.artifacts[0].id,
+    )
+
+    impact = services.repository.inspect_file_deletion(
+        "tenant-a", workspace.id, ingested.file_id
+    )
+
+    assert unrelated.id not in impact.message_ids
+
+
+def test_invalid_merge_source_plan_does_not_expand_deletion_impact(
+    services, workspace
+):
+    left = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "invalid-left.csv",
+        pd.DataFrame({"key": [1]}).to_csv(index=False).encode(),
+        {"invalid-left": {}},
+    )
+    right = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "invalid-right.csv",
+        pd.DataFrame({"key": [2]}).to_csv(index=False).encode(),
+        {"invalid-right": {}},
+    )
+    conversation = services.repository.get_or_create_conversation(
+        "tenant-a", workspace.id
+    )
+    request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "invalid merge plan"
+    )
+    run = services.repository.create_analysis_run(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        left.artifacts[0].id,
+        request.safe_content,
+        {},
+        3,
+        request_message_id=request.id,
+    )
+    services.repository.create_analysis_plan_version(
+        "tenant-a",
+        run["id"],
+        {
+            "input_artifact_id": left.artifacts[0].id,
+            "operations": [
+                {
+                    "action": "merge",
+                    "right_artifact_id": right.artifacts[0].id,
+                }
+            ],
+        },
+        "initial",
+    )
+
+    impact = services.repository.inspect_file_deletion(
+        "tenant-a", workspace.id, right.file_id
+    )
+
+    assert run["id"] not in impact.analysis_run_ids
+    assert request.id not in impact.message_ids
+
+
+def test_file_deletion_rebuilds_long_conversation_summaries_exactly(
+    services, workspace
+):
+    ingested = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "summary.csv",
+        pd.DataFrame({"value": [1]}).to_csv(index=False).encode(),
+        {"summary": {}},
+    )
+
+    conversation_ids: list[str] = []
+    for prefix, padding in (("short", ""), ("long", "x" * 300)):
+        conversation = services.repository.create_conversation(
+            "tenant-a", workspace.id, prefix
+        )
+        conversation_ids.append(conversation["id"])
+        request = services.conversations.add_user_message(
+            "tenant-a", conversation["id"], f"delete {prefix} exchange"
+        )
+        run = services.repository.create_analysis_run(
+            "tenant-a",
+            workspace.id,
+            conversation["id"],
+            ingested.artifacts[0].id,
+            request.safe_content,
+            {},
+            3,
+            request_message_id=request.id,
+        )
+        services.repository.add_message(
+            "tenant-a",
+            conversation["id"],
+            "assistant",
+            f"delete {prefix} response",
+            ingested.artifacts[0].id,
+            analysis_run_id=run["id"],
+        )
+        for index in range(34):
+            message = services.repository.add_message(
+                "tenant-a",
+                conversation["id"],
+                "system",
+                f"{prefix}-{index:02d}-{padding}",
+            )
+            with services.repository._connect() as connection:
+                connection.execute(
+                    "UPDATE messages SET created_at = ? WHERE id = ?",
+                    (f"2026-01-01T00:00:{index:02d}+00:00", message.id),
+                )
+
+    services.data_sources.delete("tenant-a", workspace.id, ingested.file_id)
+
+    short_summary = services.repository.get_conversation(
+        "tenant-a", conversation_ids[0]
+    )["safe_summary"]
+    assert short_summary == "\n".join(
+        f"system: short-{index:02d}-" for index in range(2, 22)
+    )
+
+    long_summary = services.repository.get_conversation(
+        "tenant-a", conversation_ids[1]
+    )["safe_summary"]
+    expected_long_summary = "\n".join(
+        f"system: long-{index:02d}-{'x' * 232}" for index in range(2, 22)
+    )[-4000:]
+    assert long_summary == expected_long_summary
+    assert len(long_summary) == 4000
+    assert "long-22-" not in long_summary
+
+
+def test_legacy_request_matching_uses_nearest_prior_duplicate_message(
+    services, workspace
+):
+    first = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "legacy-first.csv",
+        pd.DataFrame({"value": [1]}).to_csv(index=False).encode(),
+        {"legacy-first": {}},
+    )
+    second = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "legacy-second.csv",
+        pd.DataFrame({"value": [2]}).to_csv(index=False).encode(),
+        {"legacy-second": {}},
+    )
+    conversation = services.repository.get_or_create_conversation(
+        "tenant-a", workspace.id
+    )
+
+    first_request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "repeat request"
+    )
+    first_run = services.repository.create_analysis_run(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        first.artifacts[0].id,
+        first_request.safe_content,
+        {},
+        3,
+    )
+    first_result = services.artifacts.save_result(
+        "tenant-a",
+        workspace.id,
+        "legacy first result",
+        pd.DataFrame({"value": [1]}),
+        {},
+        (first.artifacts[0].id,),
+    )
+    first_response = services.repository.add_message(
+        "tenant-a",
+        conversation["id"],
+        "assistant",
+        "legacy first ready",
+        first_result.id,
+    )
+
+    second_request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "repeat request"
+    )
+    services.repository.create_analysis_run(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        second.artifacts[0].id,
+        second_request.safe_content,
+        {},
+        3,
+    )
+    second_result = services.artifacts.save_result(
+        "tenant-a",
+        workspace.id,
+        "legacy second result",
+        pd.DataFrame({"value": [2]}),
+        {},
+        (second.artifacts[0].id,),
+    )
+    second_response = services.repository.add_message(
+        "tenant-a",
+        conversation["id"],
+        "assistant",
+        "legacy second ready",
+        second_result.id,
+    )
+
+    impact = services.repository.inspect_file_deletion(
+        "tenant-a", workspace.id, first.file_id
+    )
+
+    assert set(impact.message_ids) == {first_request.id, first_response.id}
+    assert second_request.id not in impact.message_ids
+    assert second_response.id not in impact.message_ids
+    assert impact.analysis_run_ids == (first_run["id"],)
+
+
 def test_inspect_dataset_version_deletion_finds_only_selected_sheet_descendants(
     services, workspace
 ):
@@ -179,6 +592,7 @@ def test_inspect_dataset_version_deletion_finds_only_selected_sheet_descendants(
     assert graph["other_sheet"].id not in impact.artifact_ids
     assert graph["encrypted_path"] not in impact.paths
     assert impact.analysis_run_ids == (graph["run"]["id"],)
+    assert impact.message_count == 2
 
 
 def test_inspect_dataset_version_deletion_rejects_cross_tenant(services, workspace):
@@ -236,7 +650,7 @@ def test_inspect_file_deletion_rejects_cross_tenant_without_mutation(services, w
     assert len(services.repository.list_artifacts("tenant-a", workspace.id)) == 3
 
 
-def test_delete_file_metadata_cascades_but_preserves_chat_and_token_mappings(
+def test_delete_file_metadata_cascades_messages_but_preserves_token_mappings(
     services, workspace
 ):
     ingested, _source, _direct, _descendant, conversation, _run = _source_graph(
@@ -254,16 +668,14 @@ def test_delete_file_metadata_cascades_but_preserves_chat_and_token_mappings(
     assert deleted.artifact_count == 3
     assert services.repository.list_files("tenant-a", workspace.id) == []
     assert services.repository.list_artifacts("tenant-a", workspace.id) == []
-    messages = services.repository.list_messages("tenant-a", conversation["id"])
-    assert messages[-1].safe_content == "result ready"
-    assert messages[-1].artifact_id is None
+    assert services.repository.list_messages("tenant-a", conversation["id"]) == []
     assert services.repository.list_mappings("tenant-a") != []
     event = services.repository.list_audit_events("tenant-a", workspace.id)[0]
     assert event["event_type"] == "file_deleted"
     assert event["details"]["artifact_count"] == 3
 
 
-def test_delete_dataset_version_metadata_cascades_but_preserves_file_and_other_sheet(
+def test_delete_dataset_version_metadata_cascades_messages_but_preserves_other_sheet(
     services, workspace
 ):
     graph = _two_sheet_graph(services, workspace)
@@ -283,11 +695,12 @@ def test_delete_dataset_version_metadata_cascades_but_preserves_file_and_other_s
     ) == graph["other_sheet"]
     with pytest.raises(RecordNotFoundError):
         services.repository.get_artifact("tenant-a", graph["source"].id)
-    messages = services.repository.list_messages(
-        "tenant-a", graph["conversation"]["id"]
+    assert (
+        services.repository.list_messages(
+            "tenant-a", graph["conversation"]["id"]
+        )
+        == []
     )
-    assert messages[-1].safe_content == "result ready"
-    assert messages[-1].artifact_id is None
     assert services.repository.list_mappings("tenant-a")
     events = services.repository.list_audit_events("tenant-a", workspace.id)
     deletion_event = next(
@@ -355,7 +768,15 @@ def test_delete_one_file_keeps_other_dataset_version_and_original_number(
 
 
 def test_delete_file_metadata_rolls_back_when_file_delete_fails(services, workspace):
-    ingested, *_ = _source_graph(services, workspace)
+    ingested, _source, _direct, _descendant, conversation, run = _source_graph(
+        services, workspace
+    )
+    services.repository.update_conversation_summary(
+        "tenant-a", conversation["id"], "summary before failure"
+    )
+    messages_before = services.repository.list_messages(
+        "tenant-a", conversation["id"], 100
+    )
     impact = services.repository.inspect_file_deletion(
         "tenant-a", workspace.id, ingested.file_id
     )
@@ -370,6 +791,52 @@ def test_delete_file_metadata_rolls_back_when_file_delete_fails(services, worksp
 
     assert len(services.repository.list_files("tenant-a", workspace.id)) == 1
     assert len(services.repository.list_artifacts("tenant-a", workspace.id)) == 3
+    assert services.repository.get_analysis_run("tenant-a", run["id"])
+    assert services.repository.list_messages(
+        "tenant-a", conversation["id"], 100
+    ) == messages_before
+    assert (
+        services.repository.get_conversation("tenant-a", conversation["id"])[
+            "safe_summary"
+        ]
+        == "summary before failure"
+    )
+
+
+def test_data_source_service_restores_files_messages_runs_and_summary_on_sqlite_failure(
+    services, workspace
+):
+    ingested, _source, _direct, _descendant, conversation, run = _source_graph(
+        services, workspace
+    )
+    services.repository.update_conversation_summary(
+        "tenant-a", conversation["id"], "summary before failure"
+    )
+    impact = services.data_sources.inspect("tenant-a", workspace.id, ingested.file_id)
+    path_contents = {path: path.read_bytes() for path in impact.paths}
+    messages_before = services.repository.list_messages(
+        "tenant-a", conversation["id"], 100
+    )
+    with services.repository._connect() as connection:
+        connection.execute(
+            """CREATE TRIGGER fail_atomic_audit_insert BEFORE INSERT ON audit_events
+            BEGIN SELECT RAISE(ABORT, 'atomic audit unavailable'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="atomic audit unavailable"):
+        services.data_sources.delete("tenant-a", workspace.id, ingested.file_id)
+
+    assert {path: path.read_bytes() for path in impact.paths} == path_contents
+    assert services.repository.get_analysis_run("tenant-a", run["id"])
+    assert services.repository.list_messages(
+        "tenant-a", conversation["id"], 100
+    ) == messages_before
+    assert (
+        services.repository.get_conversation("tenant-a", conversation["id"])[
+            "safe_summary"
+        ]
+        == "summary before failure"
+    )
 
 
 def test_data_source_service_removes_files_and_metadata(services, workspace):
@@ -386,11 +853,7 @@ def test_data_source_service_removes_files_and_metadata(services, workspace):
     assert not source.path.exists()
     assert not direct.path.exists()
     assert not descendant.path.exists()
-    messages = services.repository.list_messages("tenant-a", conversation["id"])
-    assert [message.safe_content for message in messages] == [
-        "汇总营收",
-        "result ready",
-    ]
+    assert services.repository.list_messages("tenant-a", conversation["id"]) == []
 
 
 def test_data_source_service_deletes_only_selected_table_files(services, workspace):
@@ -413,7 +876,7 @@ def test_data_source_service_deletes_only_selected_table_files(services, workspa
     assert [
         message.safe_content
         for message in services.repository.list_messages("tenant-a", graph["conversation"]["id"])
-    ] == ["汇总营收", "result ready"]
+    ] == []
 
 
 def test_data_source_service_restores_table_files_when_metadata_delete_fails(

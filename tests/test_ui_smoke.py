@@ -9,7 +9,7 @@ from streamlit.testing.v1 import AppTest
 
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.config import AppConfig
-from tuoming_agent.storage.sqlite import TableDeletionImpact
+from tuoming_agent.storage.sqlite import DeletionImpact, TableDeletionImpact
 from tuoming_agent.ui import app as ui_app
 from tuoming_agent.workspace.data_sources import DataSourceDeletionError
 from tuoming_agent.workspace.service import create_services
@@ -70,6 +70,7 @@ def test_table_deletion_requires_acknowledgement_for_related_analysis(monkeypatc
         row_count=643,
         artifact_ids=("source-a", "result-a"),
         analysis_run_ids=("run-a",),
+        message_ids=("request-a", "response-a"),
         paths=(Path("source.parquet"), Path("result.parquet")),
     )
 
@@ -114,7 +115,64 @@ def test_table_deletion_requires_acknowledgement_for_related_analysis(monkeypatc
 
     assert disabled == [True]
     assert Services.data_sources.deleted is False
-    assert any("book::page" in warning and "643" in warning for warning in warnings)
+    assert any(
+        "book::page" in warning
+        and "643" in warning
+        and "关联对话 2 条" in warning
+        for warning in warnings
+    )
+
+
+def test_file_deletion_shows_message_count_and_requires_acknowledgement(monkeypatch):
+    impact = DeletionImpact(
+        file_id="file-a",
+        original_name="source.csv",
+        sha256="abc123",
+        dataset_version_ids=("version-a",),
+        dataset_ids=("dataset-a",),
+        artifact_ids=("source-a",),
+        analysis_run_ids=(),
+        message_ids=("request-a",),
+        paths=(Path("source.enc"), Path("source.parquet")),
+    )
+
+    class DataSources:
+        deleted = False
+
+        def inspect(self, *_args):
+            return impact
+
+        def delete(self, *_args):
+            self.deleted = True
+
+    class Services:
+        data_sources = DataSources()
+
+    warnings: list[str] = []
+    disabled: list[bool] = []
+    state = {"pending-delete-workspace": "file-a"}
+    monkeypatch.setattr(ui_app.st, "session_state", state)
+    monkeypatch.setattr(ui_app.st, "warning", warnings.append)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "checkbox", lambda *_args, **_kwargs: False)
+
+    def button(label, **kwargs):
+        if label == "确认删除":
+            disabled.append(kwargs["disabled"])
+        return False
+
+    monkeypatch.setattr(ui_app.st, "button", button)
+
+    ui_app._render_file_deletion(
+        Services(),
+        "tenant",
+        "workspace",
+        {"id": "file-a", "original_name": "source.csv"},
+    )
+
+    assert disabled == [True]
+    assert Services.data_sources.deleted is False
+    assert any("关联对话 1 条" in warning for warning in warnings)
 
 
 def test_confirmed_table_deletion_calls_service_and_refreshes(monkeypatch):

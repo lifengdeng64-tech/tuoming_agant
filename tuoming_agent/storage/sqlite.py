@@ -213,6 +213,7 @@ class DeletionImpact:
     artifact_ids: tuple[str, ...]
     analysis_run_ids: tuple[str, ...]
     paths: tuple[Path, ...]
+    message_ids: tuple[str, ...] = ()
 
     @property
     def dataset_version_count(self) -> int:
@@ -226,6 +227,10 @@ class DeletionImpact:
     def analysis_run_count(self) -> int:
         return len(self.analysis_run_ids)
 
+    @property
+    def message_count(self) -> int:
+        return len(self.message_ids)
+
 
 @dataclass(frozen=True)
 class TableDeletionImpact:
@@ -238,6 +243,7 @@ class TableDeletionImpact:
     artifact_ids: tuple[str, ...]
     analysis_run_ids: tuple[str, ...]
     paths: tuple[Path, ...]
+    message_ids: tuple[str, ...] = ()
 
     @property
     def artifact_count(self) -> int:
@@ -246,6 +252,10 @@ class TableDeletionImpact:
     @property
     def analysis_run_count(self) -> int:
         return len(self.analysis_run_ids)
+
+    @property
+    def message_count(self) -> int:
+        return len(self.message_ids)
 
 
 class SQLiteRepository:
@@ -645,33 +655,11 @@ class SQLiteRepository:
                 raise RuntimeError(
                     "Data source dependencies changed during deletion; inspect and confirm again."
                 )
-            self._delete_ids(
+            affected_conversation_ids = self._delete_analysis_records(
                 connection,
-                "analysis_plan_versions",
-                "run_id",
-                actual.analysis_run_ids,
                 tenant_id,
-            )
-            self._delete_ids(
-                connection,
-                "analysis_attempts",
-                "run_id",
                 actual.analysis_run_ids,
-                tenant_id,
-            )
-            self._delete_ids(
-                connection,
-                "analysis_run_messages",
-                "run_id",
-                actual.analysis_run_ids,
-                tenant_id,
-            )
-            self._delete_ids(
-                connection,
-                "analysis_runs",
-                "id",
-                actual.analysis_run_ids,
-                tenant_id,
+                actual.message_ids,
             )
             if actual.artifact_ids:
                 placeholders = ",".join("?" for _ in actual.artifact_ids)
@@ -719,6 +707,9 @@ class SQLiteRepository:
                     )""",
                     (tenant_id, workspace_id, *actual.dataset_ids),
                 )
+            self._rebuild_conversation_summaries(
+                connection, tenant_id, affected_conversation_ids
+            )
             connection.execute(
                 """INSERT INTO audit_events(
                     id, tenant_id, workspace_id, event_type, details_json, created_at
@@ -735,6 +726,7 @@ class SQLiteRepository:
                             "dataset_version_count": actual.dataset_version_count,
                             "artifact_count": actual.artifact_count,
                             "analysis_run_count": actual.analysis_run_count,
+                            "message_count": actual.message_count,
                         },
                         ensure_ascii=True,
                     ),
@@ -758,33 +750,11 @@ class SQLiteRepository:
                 raise RuntimeError(
                     "Dataset dependencies changed during deletion; inspect and confirm again."
                 )
-            self._delete_ids(
+            affected_conversation_ids = self._delete_analysis_records(
                 connection,
-                "analysis_plan_versions",
-                "run_id",
-                actual.analysis_run_ids,
                 tenant_id,
-            )
-            self._delete_ids(
-                connection,
-                "analysis_attempts",
-                "run_id",
                 actual.analysis_run_ids,
-                tenant_id,
-            )
-            self._delete_ids(
-                connection,
-                "analysis_run_messages",
-                "run_id",
-                actual.analysis_run_ids,
-                tenant_id,
-            )
-            self._delete_ids(
-                connection,
-                "analysis_runs",
-                "id",
-                actual.analysis_run_ids,
-                tenant_id,
+                actual.message_ids,
             )
             if actual.artifact_ids:
                 placeholders = ",".join("?" for _ in actual.artifact_ids)
@@ -822,6 +792,9 @@ class SQLiteRepository:
                 )""",
                 (actual.dataset_id, tenant_id, workspace_id),
             )
+            self._rebuild_conversation_summaries(
+                connection, tenant_id, affected_conversation_ids
+            )
             connection.execute(
                 """INSERT INTO audit_events(
                     id, tenant_id, workspace_id, event_type, details_json, created_at
@@ -839,6 +812,7 @@ class SQLiteRepository:
                             "version": actual.version,
                             "artifact_count": actual.artifact_count,
                             "analysis_run_count": actual.analysis_run_count,
+                            "message_count": actual.message_count,
                         },
                         ensure_ascii=True,
                     ),
@@ -861,7 +835,9 @@ class SQLiteRepository:
             ("analysis_plan_versions", "run_id"),
             ("analysis_attempts", "run_id"),
             ("analysis_run_messages", "run_id"),
+            ("analysis_run_messages", "message_id"),
             ("analysis_runs", "id"),
+            ("messages", "id"),
             ("column_policies", "dataset_version_id"),
             ("dataset_versions", "id"),
             ("artifacts", "id"),
@@ -873,6 +849,104 @@ class SQLiteRepository:
             f"DELETE FROM {table} WHERE tenant_id = ? AND {column} IN ({placeholders})",
             (tenant_id, *record_ids),
         )
+
+    @classmethod
+    def _delete_analysis_records(
+        cls,
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        analysis_run_ids: tuple[str, ...],
+        message_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        affected_conversation_ids = cls._conversation_ids_for_messages(
+            connection, tenant_id, message_ids
+        )
+        cls._delete_ids(
+            connection,
+            "analysis_run_messages",
+            "run_id",
+            analysis_run_ids,
+            tenant_id,
+        )
+        cls._delete_ids(
+            connection,
+            "analysis_run_messages",
+            "message_id",
+            message_ids,
+            tenant_id,
+        )
+        cls._delete_ids(connection, "messages", "id", message_ids, tenant_id)
+        cls._delete_ids(
+            connection,
+            "analysis_plan_versions",
+            "run_id",
+            analysis_run_ids,
+            tenant_id,
+        )
+        cls._delete_ids(
+            connection,
+            "analysis_attempts",
+            "run_id",
+            analysis_run_ids,
+            tenant_id,
+        )
+        cls._delete_ids(
+            connection,
+            "analysis_runs",
+            "id",
+            analysis_run_ids,
+            tenant_id,
+        )
+        return affected_conversation_ids
+
+    @staticmethod
+    def _conversation_ids_for_messages(
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        message_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if not message_ids:
+            return ()
+        placeholders = ",".join("?" for _ in message_ids)
+        rows = connection.execute(
+            f"""SELECT DISTINCT conversation_id FROM messages
+            WHERE tenant_id = ? AND id IN ({placeholders})""",
+            (tenant_id, *message_ids),
+        ).fetchall()
+        return tuple(sorted(row["conversation_id"] for row in rows))
+
+    @staticmethod
+    def _rebuild_conversation_summaries(
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        conversation_ids: tuple[str, ...],
+    ) -> None:
+        now = utc_now()
+        for conversation_id in conversation_ids:
+            count = connection.execute(
+                """SELECT COUNT(*) AS message_count FROM messages
+                WHERE tenant_id = ? AND conversation_id = ?""",
+                (tenant_id, conversation_id),
+            ).fetchone()["message_count"]
+            summary = ""
+            if count > 20:
+                rows = connection.execute(
+                    """SELECT role, safe_content FROM messages
+                    WHERE tenant_id = ? AND conversation_id = ?
+                    ORDER BY created_at DESC, id DESC LIMIT 32""",
+                    (tenant_id, conversation_id),
+                ).fetchall()
+                chronological = list(reversed(rows))
+                older = chronological[:-12]
+                summary = "\n".join(
+                    f"{message['role']}: {message['safe_content'][:240]}"
+                    for message in older[-20:]
+                )[-4000:]
+            connection.execute(
+                """UPDATE conversations SET safe_summary = ?, updated_at = ?
+                WHERE id = ? AND tenant_id = ?""",
+                (summary, now, conversation_id, tenant_id),
+            )
 
     @staticmethod
     def _inspect_file_deletion(
@@ -896,11 +970,13 @@ class SQLiteRepository:
             WHERE tenant_id = ? AND file_id = ?""",
             (tenant_id, file_id),
         ).fetchall()
-        artifact_ids, runs, artifact_paths = SQLiteRepository._artifact_deletion_graph(
-            connection,
-            tenant_id,
-            workspace_id,
-            {row["artifact_id"] for row in versions},
+        artifact_ids, runs, message_ids, artifact_paths = (
+            SQLiteRepository._artifact_deletion_graph(
+                connection,
+                tenant_id,
+                workspace_id,
+                {row["artifact_id"] for row in versions},
+            )
         )
         return DeletionImpact(
             file_id=file_id,
@@ -911,6 +987,7 @@ class SQLiteRepository:
             artifact_ids=artifact_ids,
             analysis_run_ids=runs,
             paths=(Path(file_row["encrypted_path"]), *artifact_paths),
+            message_ids=message_ids,
         )
 
     @staticmethod
@@ -953,7 +1030,7 @@ class SQLiteRepository:
         if row["file_workspace_id"] != workspace_id:
             raise AuthorizationError("Dataset file belongs to another workspace.")
 
-        artifact_ids, runs, paths = SQLiteRepository._artifact_deletion_graph(
+        artifact_ids, runs, message_ids, paths = SQLiteRepository._artifact_deletion_graph(
             connection, tenant_id, workspace_id, {row["artifact_id"]}
         )
         return TableDeletionImpact(
@@ -966,6 +1043,7 @@ class SQLiteRepository:
             artifact_ids=artifact_ids,
             analysis_run_ids=runs,
             paths=paths,
+            message_ids=message_ids,
         )
 
     @staticmethod
@@ -974,7 +1052,14 @@ class SQLiteRepository:
         tenant_id: str,
         workspace_id: str,
         source_artifact_ids: set[str],
-    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[Path, ...]]:
+    ) -> tuple[
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[Path, ...],
+    ]:
+        from tuoming_agent.analysis.models import AnalysisPlan, MergeOperation
+
         all_artifacts = connection.execute(
             """SELECT id, path, parent_ids_json FROM artifacts
             WHERE tenant_id = ? AND workspace_id = ?""",
@@ -993,23 +1078,93 @@ class SQLiteRepository:
                     artifact_ids.add(artifact["id"])
                     changed = True
 
+        all_runs = connection.execute(
+            """SELECT id, conversation_id, source_artifact_id, safe_request,
+                      result_artifact_id, created_at
+            FROM analysis_runs WHERE tenant_id = ? AND workspace_id = ?""",
+            (tenant_id, workspace_id),
+        ).fetchall()
+        runs_by_id = {
+            row["id"]: row
+            for row in all_runs
+            if row["source_artifact_id"] in artifact_ids
+            or row["result_artifact_id"] in artifact_ids
+        }
+        all_runs_by_id = {row["id"]: row for row in all_runs}
+        plan_rows = connection.execute(
+            """SELECT analysis_plan_versions.run_id, analysis_plan_versions.plan_json
+            FROM analysis_plan_versions
+            JOIN analysis_runs ON analysis_runs.id = analysis_plan_versions.run_id
+            WHERE analysis_plan_versions.tenant_id = ?
+              AND analysis_runs.tenant_id = ?
+              AND analysis_runs.workspace_id = ?""",
+            (tenant_id, tenant_id, workspace_id),
+        ).fetchall()
+        for plan_row in plan_rows:
+            try:
+                plan = AnalysisPlan.model_validate_json(plan_row["plan_json"])
+            except ValueError:
+                continue
+            if any(
+                isinstance(operation, MergeOperation)
+                and operation.right_artifact_id in artifact_ids
+                for operation in plan.operations
+            ):
+                run = all_runs_by_id[plan_row["run_id"]]
+                runs_by_id[run["id"]] = run
+
+        run_ids = tuple(sorted(runs_by_id))
+        message_ids: set[str] = set()
+        linked_request_run_ids: set[str] = set()
+        if run_ids:
+            placeholders = ",".join("?" for _ in run_ids)
+            links = connection.execute(
+                f"""SELECT run_id, message_id, kind FROM analysis_run_messages
+                WHERE tenant_id = ? AND run_id IN ({placeholders})""",
+                (tenant_id, *run_ids),
+            ).fetchall()
+            message_ids.update(row["message_id"] for row in links)
+            linked_request_run_ids.update(
+                row["run_id"] for row in links if row["kind"] == "request"
+            )
+
         if artifact_ids:
             placeholders = ",".join("?" for _ in artifact_ids)
-            runs = connection.execute(
-                f"""SELECT id FROM analysis_runs
-                WHERE tenant_id = ? AND workspace_id = ?
-                AND (source_artifact_id IN ({placeholders})
-                     OR result_artifact_id IN ({placeholders}))""",
-                (tenant_id, workspace_id, *artifact_ids, *artifact_ids),
+            responses = connection.execute(
+                f"""SELECT messages.id FROM messages
+                JOIN conversations ON conversations.id = messages.conversation_id
+                WHERE messages.tenant_id = ? AND conversations.tenant_id = ?
+                  AND conversations.workspace_id = ? AND messages.role = 'assistant'
+                  AND messages.artifact_id IN ({placeholders})""",
+                (tenant_id, tenant_id, workspace_id, *artifact_ids),
             ).fetchall()
-        else:
-            runs = []
+            message_ids.update(row["id"] for row in responses)
+
+        for run_id, run in runs_by_id.items():
+            if run_id in linked_request_run_ids:
+                continue
+            legacy_request = connection.execute(
+                """SELECT id FROM messages
+                WHERE tenant_id = ? AND conversation_id = ? AND role = 'user'
+                  AND safe_content = ? AND created_at <= ?
+                ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (
+                    tenant_id,
+                    run["conversation_id"],
+                    run["safe_request"],
+                    run["created_at"],
+                ),
+            ).fetchone()
+            if legacy_request is not None:
+                message_ids.add(legacy_request["id"])
+
         artifact_paths = tuple(
             Path(row["path"]) for row in all_artifacts if row["id"] in artifact_ids
         )
         return (
             tuple(sorted(artifact_ids)),
-            tuple(sorted(row["id"] for row in runs)),
+            run_ids,
+            tuple(sorted(message_ids)),
             tuple(sorted(artifact_paths)),
         )
 

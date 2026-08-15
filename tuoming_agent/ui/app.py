@@ -464,11 +464,15 @@ def _render_dataset_version_deletion(
         st.warning(f"无法检查工作表删除影响：{exc}")
         return
 
-    has_dependencies = impact.analysis_run_count > 0 or impact.artifact_count > 1
+    has_dependencies = (
+        impact.analysis_run_count > 0
+        or impact.artifact_count > 1
+        or impact.message_count > 0
+    )
     st.warning(
         f"将删除工作表 {impact.logical_name} V{impact.version}（{impact.row_count:,} 行）、"
         f"{impact.artifact_count} 个本地制品和 "
-        f"{impact.analysis_run_count} 个关联分析。聊天文字会保留。"
+        f"{impact.analysis_run_count} 个关联分析、关联对话 {impact.message_count} 条。"
     )
     acknowledged = True
     if has_dependencies:
@@ -528,11 +532,15 @@ def _render_file_deletion(
         st.warning(f"无法检查删除影响：{exc}")
         return
 
-    has_dependencies = impact.analysis_run_count > 0 or impact.artifact_count > 1
+    has_dependencies = (
+        impact.analysis_run_count > 0
+        or impact.artifact_count > 1
+        or impact.message_count > 0
+    )
     st.warning(
         f"将删除 {impact.dataset_version_count} 个数据版本、"
         f"{impact.artifact_count} 个本地制品和 "
-        f"{impact.analysis_run_count} 个关联分析。聊天文字会保留。"
+        f"{impact.analysis_run_count} 个关联分析、关联对话 {impact.message_count} 条。"
     )
     acknowledged = True
     if has_dependencies:
