@@ -10,7 +10,7 @@ from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.naming import (
     GENERATED_NAME_RULE,
     GeneratedNameValidationError,
-    generated_name_issues,
+    generated_name_issue_paths,
 )
 from tuoming_agent.security.dlp import PromptSanitizer
 
@@ -82,8 +82,8 @@ class SafeAnalysisPlanner:
                 else AnalysisPlan.model_validate(result)
             )
             self.sanitizer.assert_safe(f"{plan.result_name}\n{plan.safe_summary}")
-            issues = generated_name_issues(plan)
-            if not issues:
+            issue_paths = generated_name_issue_paths(plan)
+            if not issue_paths:
                 return plan
             if attempt == 1:
                 raise GeneratedNameValidationError(
@@ -92,7 +92,7 @@ class SafeAnalysisPlanner:
             payload_data = {
                 **payload_data,
                 "generated_name_feedback": {
-                    "issues": list(issues),
+                    "issues": list(issue_paths),
                     "rule": GENERATED_NAME_RULE,
                 },
             }

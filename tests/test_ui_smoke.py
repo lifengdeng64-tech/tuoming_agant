@@ -142,6 +142,93 @@ def test_generated_name_error_is_shown_in_chinese(monkeypatch, tmp_path: Path):
     assert errors == [message]
 
 
+def test_revision_generated_name_error_is_shown_without_rerun(monkeypatch):
+    message = "模型未能生成合规的中文字段名称，请重试。"
+    plan = AnalysisPlan(
+        input_artifact_id="artifact-a",
+        result_name="营收分析",
+        operations=[{"action": "head", "rows": 5}],
+    )
+    current_plan = SimpleNamespace(
+        version=1,
+        plan=plan,
+        reason="initial",
+        decision="pending",
+    )
+    snapshot = SimpleNamespace(
+        run={
+            "id": "run-a",
+            "status": "awaiting_confirmation",
+            "repair_count": 0,
+            "max_repairs": 3,
+            "source_artifact_id": "artifact-a",
+        },
+        plan_versions=(current_plan,),
+        attempts=(),
+        current_plan=current_plan,
+    )
+
+    class Sanitizer:
+        @staticmethod
+        def sanitize(_tenant_id, text):
+            return text
+
+    class Conversations:
+        sanitizer = Sanitizer()
+
+        @staticmethod
+        def build_safe_context(*_args, **_kwargs):
+            return {}
+
+    class Masking:
+        @staticmethod
+        def restore_display_value(_tenant_id, value):
+            return value
+
+    class Workflow:
+        @staticmethod
+        def revise(*_args, **_kwargs):
+            raise GeneratedNameValidationError(message)
+
+    services = SimpleNamespace(conversations=Conversations(), masking=Masking())
+    errors: list[str] = []
+    action_column = SimpleNamespace(button=lambda *_args, **_kwargs: False)
+
+    monkeypatch.setattr(ui_app.st, "container", lambda *_args, **_kwargs: _EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "subheader", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "markdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "columns", lambda *_args, **_kwargs: (action_column,) * 2)
+    monkeypatch.setattr(ui_app.st, "form", lambda *_args, **_kwargs: _EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "text_area", lambda *_args, **_kwargs: "请修改字段")
+    monkeypatch.setattr(ui_app.st, "form_submit_button", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ui_app.st, "spinner", lambda *_args, **_kwargs: _EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "error", errors.append)
+    monkeypatch.setattr(
+        ui_app.st,
+        "rerun",
+        lambda: (_ for _ in ()).throw(AssertionError("命名错误后不应重新运行")),
+    )
+    monkeypatch.setattr(
+        ui_app,
+        "_set_flash",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("命名错误不应显示成功通知")
+        ),
+    )
+
+    ui_app._render_workflow_card(
+        services,
+        Workflow(),
+        snapshot,
+        "tenant-a",
+        "workspace-a",
+        "conversation-a",
+    )
+
+    assert errors == [message]
+
+
 def test_table_deletion_requires_acknowledgement_for_related_analysis(monkeypatch):
     impact = TableDeletionImpact(
         dataset_version_id="version-a",

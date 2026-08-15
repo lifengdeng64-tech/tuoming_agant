@@ -190,13 +190,18 @@ def test_planner_retries_once_with_safe_generated_name_feedback(services) -> Non
         [
             AnalysisPlan(
                 input_artifact_id="artifact-id",
-                result_name="revenue report",
+                result_name=token,
                 operations=[
                     {
-                        "action": "filter",
-                        "column": "brand_code",
-                        "operator": "eq",
-                        "value": token,
+                        "action": "groupby",
+                        "by": ["brand_code"],
+                        "aggregations": [
+                            {
+                                "column": "revenue",
+                                "function": "sum",
+                                "output": "华住_revenue",
+                            }
+                        ],
                     }
                 ],
             ),
@@ -205,10 +210,11 @@ def test_planner_retries_once_with_safe_generated_name_feedback(services) -> Non
                 result_name="品牌营收分析",
                 operations=[
                     {
-                        "action": "filter",
-                        "column": "brand_code",
-                        "operator": "eq",
-                        "value": token,
+                        "action": "groupby",
+                        "by": ["brand_code"],
+                        "aggregations": [
+                            {"column": "revenue", "function": "sum", "output": "本期营收"}
+                        ],
                     }
                 ],
             ),
@@ -228,12 +234,15 @@ def test_planner_retries_once_with_safe_generated_name_feedback(services) -> Non
     assert len(model.calls) == 2
     assert "generated_name_feedback" not in json.loads(model.calls[0][1][1])
     feedback = json.loads(model.calls[1][1][1])["generated_name_feedback"]
-    assert feedback["issues"] == ["result_name: revenue report"]
+    assert feedback["issues"] == [
+        "result_name",
+        "operations[0].aggregations[0].output",
+    ]
     assert "rule" in feedback
-    serialized_feedback = json.dumps(feedback, ensure_ascii=False)
-    assert "brand_code" not in serialized_feedback
-    assert token not in serialized_feedback
-    assert "华住" not in serialized_feedback
+    retry_payload = model.calls[1][1][1]
+    assert token not in retry_payload
+    assert "华住" not in retry_payload
+    assert "华住_revenue" not in retry_payload
 
 
 def test_planner_rejects_second_invalid_generated_name_response(services) -> None:

@@ -812,12 +812,16 @@ def _render_workflow_card(
                     conversation_id,
                     preferred_artifact_id=snapshot.run["source_artifact_id"],
                 )
-                with st.spinner("正在生成新版计划"):
-                    workflow.revise(
-                        tenant_id, snapshot.run["id"], safe_feedback, context
-                    )
-                _set_flash("success", "新版计划已生成，请再次确认。")
-                st.rerun()
+                try:
+                    with st.spinner("正在生成新版计划"):
+                        workflow.revise(
+                            tenant_id, snapshot.run["id"], safe_feedback, context
+                        )
+                except GeneratedNameValidationError as exc:
+                    st.error(str(exc))
+                else:
+                    _set_flash("success", "新版计划已生成，请再次确认。")
+                    st.rerun()
 
         elif status == "completed":
             st.success(f"质量校验通过，制品 {snapshot.run['result_artifact_id'][:8]} 已保存。")
