@@ -159,6 +159,56 @@ def test_reupload_complete_workbook_is_a_duplicate_without_new_artifacts(
     } == artifact_ids_before
 
 
+def test_reupload_rejects_stream_changed_before_restored_sheet_publication(
+    monkeypatch, services, workspace
+):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame({"value": [1]}).to_excel(writer, sheet_name="Sheet1", index=False)
+        pd.DataFrame({"value": [2]}).to_excel(writer, sheet_name="page", index=False)
+    payload = buffer.getvalue()
+    policies = {"sales::Sheet1": {}, "sales::page": {}}
+    original = services.ingestion.ingest(
+        "tenant-a", workspace.id, "sales.xlsx", BytesIO(payload), policies
+    )
+    versions = services.repository.get_file_versions("tenant-a", original.file_id)
+    page_version_id = next(
+        row["id"] for row in versions if row["logical_name"] == "sales::page"
+    )
+    services.data_sources.delete_table("tenant-a", workspace.id, page_version_id)
+    artifacts_before = {
+        artifact.id
+        for artifact in services.repository.list_artifacts("tenant-a", workspace.id)
+    }
+    source = BytesIO(payload)
+    original_write = services.ingestion.artifact_store.write_chunks
+
+    def mutate_after_write(*args, **kwargs):
+        path = original_write(*args, **kwargs)
+        source.seek(0)
+        source.write(b"x" * len(payload))
+        source.truncate()
+        return path
+
+    monkeypatch.setattr(
+        services.ingestion.artifact_store, "write_chunks", mutate_after_write
+    )
+
+    with pytest.raises(ValueError, match="changed while it was being ingested"):
+        services.ingestion.ingest(
+            "tenant-a", workspace.id, "sales.xlsx", source, policies
+        )
+
+    remaining_versions = services.repository.get_file_versions(
+        "tenant-a", original.file_id
+    )
+    assert {row["logical_name"] for row in remaining_versions} == {"sales::Sheet1"}
+    assert {
+        artifact.id
+        for artifact in services.repository.list_artifacts("tenant-a", workspace.id)
+    } == artifacts_before
+
+
 def test_excel_all_sheets_and_same_name_versions(services, workspace):
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:

@@ -11,6 +11,7 @@ from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.config import AppConfig
 from tuoming_agent.storage.sqlite import TableDeletionImpact
 from tuoming_agent.ui import app as ui_app
+from tuoming_agent.workspace.data_sources import DataSourceDeletionError
 from tuoming_agent.workspace.service import create_services
 
 
@@ -168,6 +169,51 @@ def test_confirmed_table_deletion_calls_service_and_refreshes(monkeypatch):
 
     assert deleted == [("tenant", "workspace", "version-a")]
     assert "pending-table-delete-workspace" not in state
+
+
+def test_table_deletion_shows_domain_failure_without_crashing(monkeypatch):
+    impact = TableDeletionImpact(
+        dataset_version_id="version-a",
+        dataset_id="dataset-a",
+        file_id="file-a",
+        logical_name="book::page",
+        version=1,
+        row_count=10,
+        artifact_ids=("source-a",),
+        analysis_run_ids=(),
+        paths=(Path("source.parquet"),),
+    )
+
+    class DataSources:
+        def inspect_table(self, *_args):
+            return impact
+
+        def delete_table(self, *_args):
+            raise DataSourceDeletionError("dependencies changed")
+
+    class Services:
+        data_sources = DataSources()
+
+    warnings: list[str] = []
+    state = {"pending-table-delete-workspace": "version-a"}
+    monkeypatch.setattr(ui_app.st, "session_state", state)
+    monkeypatch.setattr(ui_app.st, "warning", warnings.append)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        ui_app.st,
+        "button",
+        lambda label, **_kwargs: label == "确认删除工作表",
+    )
+
+    ui_app._render_dataset_version_deletion(
+        Services(),
+        "tenant",
+        "workspace",
+        {"dataset_version_id": "version-a"},
+    )
+
+    assert warnings[-1] == "删除失败，原数据已保留：dependencies changed"
+    assert state["pending-table-delete-workspace"] == "version-a"
 
 
 def test_streamlit_workspace_renders_without_runtime_errors(monkeypatch, tmp_path: Path):

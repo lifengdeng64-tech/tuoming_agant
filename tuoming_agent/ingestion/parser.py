@@ -36,10 +36,45 @@ def iter_file_chunks(
         encoding = _detect_csv_encoding(source)
         source.seek(0)
         try:
+            numeric_candidates: set[str] | None = None
+            columns_with_values: set[str] = set()
             for dataframe in pd.read_csv(
-                source, encoding=encoding, chunksize=chunk_rows, skip_blank_lines=False
+                source,
+                encoding=encoding,
+                chunksize=chunk_rows,
+                skip_blank_lines=False,
+                keep_default_na=False,
+                dtype=str,
             ):
-                yield ParsedTable(stem, None, _normalize_missing_values(dataframe))
+                normalized = _normalize_missing_values(dataframe)
+                if numeric_candidates is None:
+                    numeric_candidates = set(normalized.columns)
+                for column in tuple(numeric_candidates):
+                    present = normalized[column].notna()
+                    if not present.any():
+                        continue
+                    columns_with_values.add(column)
+                    numeric = pd.to_numeric(normalized.loc[present, column], errors="coerce")
+                    if numeric.isna().any():
+                        numeric_candidates.discard(column)
+
+            numeric_columns = (numeric_candidates or set()) & columns_with_values
+            source.seek(0)
+            for dataframe in pd.read_csv(
+                source,
+                encoding=encoding,
+                chunksize=chunk_rows,
+                skip_blank_lines=False,
+                keep_default_na=False,
+                dtype=str,
+            ):
+                yield ParsedTable(
+                    stem,
+                    None,
+                    _normalize_missing_values(
+                        dataframe, numeric_columns=numeric_columns
+                    ),
+                )
         except (UnicodeDecodeError, pd.errors.ParserError) as exc:
             raise UnsupportedFileError("CSV structure could not be parsed.") from exc
         return
@@ -103,9 +138,14 @@ def _read_csv(content: bytes | BinaryIO, sample_rows: int | None = None) -> pd.D
         try:
             source.seek(0)
             dataframe = pd.read_csv(
-                source, encoding=encoding, nrows=sample_rows, skip_blank_lines=False
+                source,
+                encoding=encoding,
+                nrows=sample_rows,
+                skip_blank_lines=False,
+                keep_default_na=False,
+                dtype=str,
             )
-            return _normalize_missing_values(dataframe)
+            return _normalize_missing_values(dataframe, infer_numeric_strings=True)
         except UnicodeDecodeError:
             errors.append(encoding)
         except pd.errors.ParserError as exc:
@@ -149,7 +189,12 @@ def _normalize_excel_headers(header: tuple[object, ...]) -> list[str]:
     return columns
 
 
-def _normalize_missing_values(dataframe: pd.DataFrame) -> pd.DataFrame:
+def _normalize_missing_values(
+    dataframe: pd.DataFrame,
+    *,
+    infer_numeric_strings: bool = False,
+    numeric_columns: set[str] | None = None,
+) -> pd.DataFrame:
     def normalize(value: object) -> object:
         if not isinstance(value, str):
             return value
@@ -158,7 +203,24 @@ def _normalize_missing_values(dataframe: pd.DataFrame) -> pd.DataFrame:
             return pd.NA
         return value
 
-    return dataframe.map(normalize).infer_objects()
+    normalized = dataframe.map(normalize).infer_objects()
+    if not infer_numeric_strings and numeric_columns is None:
+        return normalized
+    columns = normalized.columns if numeric_columns is None else numeric_columns
+    for column in columns:
+        series = normalized[column]
+        if not (
+            pd.api.types.is_object_dtype(series.dtype)
+            or pd.api.types.is_string_dtype(series.dtype)
+        ):
+            continue
+        present = series.notna()
+        if not present.any():
+            continue
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric[present].notna().all():
+            normalized[column] = numeric
+    return normalized.infer_objects()
 
 
 def _read_excel(

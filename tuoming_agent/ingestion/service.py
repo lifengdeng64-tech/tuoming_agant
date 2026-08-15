@@ -168,6 +168,7 @@ class IngestionService:
                 artifact_path = self.artifact_store.write_chunks(
                     tenant_id, workspace_id, artifact_id, masked_chunks()
                 )
+                schema, row_count = self.artifact_store.inspect_parquet(artifact_path)
                 artifact_name = (
                     f"{existing_stem}::{sheet_name}"
                     if existing_stem and sheet_name is not None
@@ -195,6 +196,9 @@ class IngestionService:
                 )
 
             if existing_file:
+                streamed_size, streamed_hash = self._measure_and_hash(source)
+                if streamed_hash != content_hash or streamed_size != byte_size:
+                    raise ValueError("Upload changed while it was being ingested.")
                 encrypted_path = Path(existing_file["encrypted_path"])
             else:
                 source.seek(0)

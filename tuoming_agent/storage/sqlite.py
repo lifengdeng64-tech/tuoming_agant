@@ -894,10 +894,18 @@ class SQLiteRepository:
         dataset_version_id: str,
     ) -> TableDeletionImpact:
         row = connection.execute(
-            """SELECT dv.*, d.logical_name, d.workspace_id, a.row_count
+            """SELECT dv.*, d.logical_name,
+                   d.tenant_id AS dataset_tenant_id,
+                   d.workspace_id AS dataset_workspace_id,
+                   a.tenant_id AS artifact_tenant_id,
+                   a.workspace_id AS artifact_workspace_id,
+                   a.row_count,
+                   f.tenant_id AS file_tenant_id,
+                   f.workspace_id AS file_workspace_id
             FROM dataset_versions dv
             JOIN datasets d ON d.id = dv.dataset_id
             JOIN artifacts a ON a.id = dv.artifact_id
+            JOIN files f ON f.id = dv.file_id
             WHERE dv.id = ?""",
             (dataset_version_id,),
         ).fetchone()
@@ -905,8 +913,18 @@ class SQLiteRepository:
             raise RecordNotFoundError("Dataset version not found.")
         if row["tenant_id"] != tenant_id:
             raise AuthorizationError("Dataset version belongs to another tenant.")
-        if row["workspace_id"] != workspace_id:
+        if row["dataset_tenant_id"] != tenant_id:
+            raise AuthorizationError("Dataset belongs to another tenant.")
+        if row["dataset_workspace_id"] != workspace_id:
             raise AuthorizationError("Dataset version belongs to another workspace.")
+        if row["artifact_tenant_id"] != tenant_id:
+            raise AuthorizationError("Dataset artifact belongs to another tenant.")
+        if row["artifact_workspace_id"] != workspace_id:
+            raise AuthorizationError("Dataset artifact belongs to another workspace.")
+        if row["file_tenant_id"] != tenant_id:
+            raise AuthorizationError("Dataset file belongs to another tenant.")
+        if row["file_workspace_id"] != workspace_id:
+            raise AuthorizationError("Dataset file belongs to another workspace.")
 
         artifact_ids, runs, paths = SQLiteRepository._artifact_deletion_graph(
             connection, tenant_id, workspace_id, {row["artifact_id"]}
@@ -930,12 +948,15 @@ class SQLiteRepository:
         workspace_id: str,
         source_artifact_ids: set[str],
     ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[Path, ...]]:
-        artifact_ids = set(source_artifact_ids)
         all_artifacts = connection.execute(
             """SELECT id, path, parent_ids_json FROM artifacts
             WHERE tenant_id = ? AND workspace_id = ?""",
             (tenant_id, workspace_id),
         ).fetchall()
+        scoped_artifact_ids = {row["id"] for row in all_artifacts}
+        if not source_artifact_ids <= scoped_artifact_ids:
+            raise AuthorizationError("Source artifact is outside the requested workspace.")
+        artifact_ids = set(source_artifact_ids)
         changed = True
         while changed:
             changed = False

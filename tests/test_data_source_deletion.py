@@ -10,6 +10,7 @@ import pytest
 
 from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
 from tuoming_agent.storage.sqlite import DeletionImpact
+from tuoming_agent.workspace.data_sources import DataSourceDeletionError
 
 
 def _source_graph(services, workspace):
@@ -174,6 +175,23 @@ def test_inspect_dataset_version_deletion_rejects_cross_tenant(services, workspa
         )
 
     assert services.repository.get_artifact("tenant-a", graph["source"].id)
+
+
+def test_inspect_dataset_version_deletion_rejects_cross_workspace_artifact(
+    services, workspace
+):
+    graph = _two_sheet_graph(services, workspace)
+    other_workspace = services.repository.create_workspace("tenant-a", "other")
+    with services.repository._connect() as connection:
+        connection.execute(
+            "UPDATE artifacts SET workspace_id = ? WHERE id = ?",
+            (other_workspace.id, graph["source"].id),
+        )
+
+    with pytest.raises(AuthorizationError, match="artifact"):
+        services.repository.inspect_dataset_version_deletion(
+            "tenant-a", workspace.id, graph["target_version"]["id"]
+        )
 
 
 def test_list_datasets_exposes_current_version_identity_and_row_count(
@@ -389,7 +407,7 @@ def test_data_source_service_restores_table_files_when_metadata_delete_fails(
         services.repository, "delete_dataset_version_metadata", fail_delete
     )
 
-    with pytest.raises(sqlite3.IntegrityError, match="metadata unavailable"):
+    with pytest.raises(DataSourceDeletionError, match="metadata unavailable"):
         services.data_sources.delete_table(
             "tenant-a", workspace.id, graph["target_version"]["id"]
         )

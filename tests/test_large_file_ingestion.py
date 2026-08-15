@@ -503,6 +503,120 @@ def test_artifact_store_writes_multiple_chunks_with_one_schema(tmp_path: Path) -
     assert list(path.parent.glob("*.tmp.parquet")) == []
 
 
+def test_artifact_store_widens_schema_when_business_text_appears_late(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    chunks = [
+        pd.DataFrame({"amount": [1, None]}),
+        pd.DataFrame({"amount": ["-", "无"]}),
+    ]
+
+    path = store.write_chunks("tenant-a", "workspace-a", "artifact-a", iter(chunks))
+    loaded = store.read_dataframe(path)
+
+    assert loaded["amount"].iloc[[0, 2, 3]].tolist() == ["1", "-", "无"]
+    assert pd.isna(loaded["amount"].iloc[1])
+    assert list(path.parent.glob("*.tmp.parquet")) == []
+
+
+def test_artifact_store_does_not_wrap_signed_and_unsigned_integers(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    chunks = [
+        pd.DataFrame({"amount": pd.Series([2**63], dtype="uint64")}),
+        pd.DataFrame({"amount": pd.Series([-1], dtype="int64")}),
+    ]
+
+    path = store.write_chunks("tenant-a", "workspace-a", "artifact-a", iter(chunks))
+
+    assert store.read_dataframe(path)["amount"].tolist() == [str(2**63), "-1"]
+
+
+def test_artifact_store_preserves_large_integer_when_float_appears_late(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    chunks = [
+        pd.DataFrame({"amount": pd.Series([2**53 + 1], dtype="int64")}),
+        pd.DataFrame({"amount": pd.Series([1.5], dtype="float64")}),
+    ]
+
+    path = store.write_chunks("tenant-a", "workspace-a", "artifact-a", iter(chunks))
+
+    assert store.read_dataframe(path)["amount"].tolist() == [str(2**53 + 1), "1.5"]
+
+
+def test_artifact_store_keeps_lossless_decimal_and_integer_chunks_numeric(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    chunks = [
+        pd.DataFrame({"amount": [1.5, None]}),
+        pd.DataFrame({"amount": pd.Series([2], dtype="int64")}),
+    ]
+
+    path = store.write_chunks("tenant-a", "workspace-a", "artifact-a", iter(chunks))
+    loaded = store.read_dataframe(path)
+
+    assert pd.api.types.is_float_dtype(loaded["amount"])
+    assert loaded["amount"].dropna().tolist() == [1.5, 2.0]
+
+
+def test_csv_preserves_unlisted_pandas_na_tokens() -> None:
+    content = b"value\nNA\n#N/A\n<NA>\nN/A\nNULL\n"
+
+    preview = preview_file("markers.csv", BytesIO(content))[0].dataframe
+    chunks = list(iter_file_chunks("markers.csv", BytesIO(content), chunk_rows=2))
+    combined = pd.concat([table.dataframe for table in chunks], ignore_index=True)
+
+    assert preview["value"].iloc[:3].tolist() == ["NA", "#N/A", "<NA>"]
+    assert combined["value"].iloc[:3].tolist() == ["NA", "#N/A", "<NA>"]
+    assert preview["value"].iloc[3:].isna().all()
+    assert combined["value"].iloc[3:].isna().all()
+
+
+def test_csv_missing_markers_do_not_force_numeric_columns_to_text(
+    services, workspace
+) -> None:
+    content = b"amount\n1\nNULL\n2\n"
+
+    preview = preview_file("numeric.csv", BytesIO(content))[0].dataframe
+    chunks = list(iter_file_chunks("numeric.csv", BytesIO(content), chunk_rows=2))
+    combined = pd.concat([table.dataframe for table in chunks], ignore_index=True)
+
+    assert pd.api.types.is_numeric_dtype(preview["amount"])
+    assert pd.api.types.is_numeric_dtype(combined["amount"])
+    assert preview["amount"].dropna().tolist() == [1.0, 2.0]
+    assert combined["amount"].dropna().tolist() == [1.0, 2.0]
+
+    result = services.ingestion.ingest(
+        "tenant-a", workspace.id, "numeric.csv", content, {"numeric": {}}
+    )
+    loaded = services.ingestion.artifact_store.read_dataframe(
+        result.artifacts[0].path
+    )
+    assert pd.api.types.is_numeric_dtype(loaded["amount"])
+    assert loaded["amount"].dropna().tolist() == [1.0, 2.0]
+
+
+def test_excel_explicit_text_with_leading_zero_stays_text() -> None:
+    source = BytesIO()
+    with pd.ExcelWriter(source, engine="openpyxl") as writer:
+        pd.DataFrame({"code": ["001", "002", "NULL"]}).to_excel(
+            writer, sheet_name="codes", index=False
+        )
+    content = source.getvalue()
+
+    preview = preview_file("codes.xlsx", BytesIO(content))[0].dataframe
+    chunks = list(iter_file_chunks("codes.xlsx", BytesIO(content), chunk_rows=2))
+    combined = pd.concat([table.dataframe for table in chunks], ignore_index=True)
+
+    assert preview["code"].dropna().tolist() == ["001", "002"]
+    assert combined["code"].dropna().tolist() == ["001", "002"]
+
+
 def test_ingestion_validates_sensitive_values_discovered_in_a_later_batch(
     services, workspace
 ) -> None:

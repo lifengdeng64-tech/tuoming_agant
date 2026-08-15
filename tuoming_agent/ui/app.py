@@ -22,6 +22,7 @@ from tuoming_agent.security.dlp import SensitiveContentError
 from tuoming_agent.security.masking import ColumnPolicy
 from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
 from tuoming_agent.ui.styles import APP_STYLES
+from tuoming_agent.workspace.data_sources import DataSourceDeletionError
 from tuoming_agent.workspace.service import ApplicationServices, create_services
 
 VIEW_OPTIONS = ("概览", "数据", "分析", "结果")
@@ -486,7 +487,13 @@ def _render_dataset_version_deletion(
             deleted = services.data_sources.delete_table(
                 tenant_id, workspace_id, dataset_version_id
             )
-        except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
+        except (
+            AuthorizationError,
+            DataSourceDeletionError,
+            RecordNotFoundError,
+            ValueError,
+            OSError,
+        ) as exc:
             st.warning(f"删除失败，原数据已保留：{exc}")
             return
         st.session_state.pop(state_key, None)

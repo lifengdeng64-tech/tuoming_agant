@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import stat
 import uuid
 from collections.abc import Callable
@@ -13,6 +14,10 @@ from tuoming_agent.storage.sqlite import (
 )
 
 T = TypeVar("T")
+
+
+class DataSourceDeletionError(RuntimeError):
+    """Raised when a confirmed deletion cannot complete safely."""
 
 
 class DataSourceService:
@@ -47,12 +52,15 @@ class DataSourceService:
         self, tenant_id: str, workspace_id: str, dataset_version_id: str
     ) -> TableDeletionImpact:
         impact = self.inspect_table(tenant_id, workspace_id, dataset_version_id)
-        return self._delete_paths(
-            impact.paths,
-            lambda: self.repository.delete_dataset_version_metadata(
-                tenant_id, workspace_id, impact
-            ),
-        )
+        try:
+            return self._delete_paths(
+                impact.paths,
+                lambda: self.repository.delete_dataset_version_metadata(
+                    tenant_id, workspace_id, impact
+                ),
+            )
+        except (RuntimeError, sqlite3.Error) as exc:
+            raise DataSourceDeletionError(str(exc)) from exc
 
     def _delete_paths(
         self, paths: tuple[Path, ...], metadata_delete: Callable[[], T]
