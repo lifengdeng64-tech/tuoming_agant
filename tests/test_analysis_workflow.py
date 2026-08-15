@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from tuoming_agent.analysis.executor import AnalysisResourceError
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.quality import QualityIssue, QualityReport
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService
+from tuoming_agent.storage.errors import AuthorizationError
 
 
 class QueuePlanner:
@@ -59,6 +61,74 @@ def test_plan_requires_confirmation_and_survives_repository_reopen(services, wor
     reopened = AnalysisWorkflowService(services.repository, services.artifacts, planner)
     restored = reopened.get_snapshot("tenant-a", snapshot.run["id"])
     assert restored.current_plan.plan == _plan(source.id)
+
+
+def test_request_message_links_an_analysis_run_and_response(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    workflow = AnalysisWorkflowService(
+        services.repository, services.artifacts, QueuePlanner([_plan(source.id)])
+    )
+    request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "汇总营收"
+    )
+
+    started = workflow.start(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        source.id,
+        request.safe_content,
+        {},
+        request_message_id=request.id,
+    )
+    services.conversations.add_assistant_message(
+        "tenant-a",
+        conversation["id"],
+        "处理完成",
+        analysis_run_id=started.run["id"],
+    )
+
+    links = services.repository.list_analysis_run_messages("tenant-a", started.run["id"])
+
+    assert [item["kind"] for item in links] == ["request", "response"]
+
+
+def test_analysis_run_message_links_reject_other_conversation_and_tenant(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    other_conversation = _conversation(services, workspace)
+    workflow = AnalysisWorkflowService(
+        services.repository, services.artifacts, QueuePlanner([_plan(source.id)])
+    )
+    other_request = services.conversations.add_user_message(
+        "tenant-a", other_conversation["id"], "汇总营收"
+    )
+
+    with pytest.raises(AuthorizationError, match="conversation"):
+        workflow.start(
+            "tenant-a",
+            workspace.id,
+            conversation["id"],
+            source.id,
+            other_request.safe_content,
+            {},
+            request_message_id=other_request.id,
+        )
+
+    started = workflow.start(
+        "tenant-a", workspace.id, conversation["id"], source.id, "汇总营收", {}
+    )
+    other_workspace = services.repository.create_workspace("tenant-b", "其他工作区")
+    tenant_b_conversation = services.repository.create_conversation("tenant-b", other_workspace.id)
+
+    with pytest.raises(AuthorizationError):
+        services.conversations.add_assistant_message(
+            "tenant-b",
+            tenant_b_conversation["id"],
+            "处理完成",
+            analysis_run_id=started.run["id"],
+        )
 
 
 def test_confirm_executes_validates_and_persists_result(services, workspace):

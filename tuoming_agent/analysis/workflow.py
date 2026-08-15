@@ -82,6 +82,7 @@ class AnalysisWorkflowService:
         source_artifact_id: str,
         safe_request: str,
         safe_context: dict[str, Any],
+        request_message_id: str | None = None,
     ) -> WorkflowSnapshot:
         run = self.repository.create_analysis_run(
             tenant_id,
@@ -91,6 +92,7 @@ class AnalysisWorkflowService:
             safe_request,
             safe_context,
             self.max_repair_attempts,
+            request_message_id,
         )
         try:
             plan = self.planner.create_plan(safe_request, safe_context)

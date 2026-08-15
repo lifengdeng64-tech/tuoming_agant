@@ -159,6 +159,18 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
 CREATE INDEX IF NOT EXISTS idx_analysis_runs_workspace
     ON analysis_runs(tenant_id, workspace_id, updated_at);
 
+CREATE TABLE IF NOT EXISTS analysis_run_messages (
+    tenant_id TEXT NOT NULL REFERENCES tenants(id),
+    run_id TEXT NOT NULL REFERENCES analysis_runs(id),
+    message_id TEXT NOT NULL REFERENCES messages(id),
+    kind TEXT NOT NULL CHECK(kind IN ('request', 'response')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(run_id, message_id),
+    UNIQUE(message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_analysis_run_messages_message
+    ON analysis_run_messages(tenant_id, message_id);
+
 CREATE TABLE IF NOT EXISTS analysis_plan_versions (
     id TEXT PRIMARY KEY,
     tenant_id TEXT NOT NULL REFERENCES tenants(id),
@@ -1221,6 +1233,7 @@ class SQLiteRepository:
         role: str,
         safe_content: str,
         artifact_id: str | None = None,
+        analysis_run_id: str | None = None,
     ) -> MessageRecord:
         if role not in {"user", "assistant", "system"}:
             raise ValueError("Unsupported message role.")
@@ -1254,6 +1267,14 @@ class SQLiteRepository:
                     created_at,
                 ),
             )
+            if analysis_run_id:
+                self._link_analysis_message(
+                    connection,
+                    tenant_id,
+                    analysis_run_id,
+                    message_id,
+                    "response",
+                )
             connection.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?",
                 (created_at, conversation_id),
@@ -1352,6 +1373,7 @@ class SQLiteRepository:
         safe_request: str,
         context: dict[str, Any],
         max_repairs: int,
+        request_message_id: str | None = None,
     ) -> dict[str, Any]:
         self.get_workspace(tenant_id, workspace_id)
         conversation = self.get_conversation(tenant_id, conversation_id)
@@ -1385,7 +1407,64 @@ class SQLiteRepository:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 tuple(record.values()),
             )
+            if request_message_id:
+                self._link_analysis_message(
+                    connection,
+                    tenant_id,
+                    record["id"],
+                    request_message_id,
+                    "request",
+                )
         return self._analysis_run_from_record(record)
+
+    def list_analysis_run_messages(self, tenant_id: str, run_id: str) -> list[dict[str, Any]]:
+        self.get_analysis_run(tenant_id, run_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT messages.*, analysis_run_messages.kind
+                FROM analysis_run_messages
+                JOIN messages ON messages.id = analysis_run_messages.message_id
+                WHERE analysis_run_messages.tenant_id = ? AND analysis_run_messages.run_id = ?
+                ORDER BY analysis_run_messages.created_at""",
+                (tenant_id, run_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _link_analysis_message(
+        self,
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        run_id: str,
+        message_id: str,
+        kind: str,
+    ) -> None:
+        expected_roles = {"request": "user", "response": "assistant"}
+        if kind not in expected_roles:
+            raise ValueError("Unsupported analysis message link kind.")
+        run = connection.execute(
+            "SELECT tenant_id, conversation_id FROM analysis_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if run is None:
+            self._raise_scoped(connection, "analysis_runs", run_id, tenant_id)
+        if run["tenant_id"] != tenant_id:
+            raise AuthorizationError("Analysis run belongs to another tenant.")
+        message = connection.execute(
+            "SELECT tenant_id, conversation_id, role FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+        if message is None:
+            self._raise_scoped(connection, "messages", message_id, tenant_id)
+        if message["tenant_id"] != tenant_id:
+            raise AuthorizationError("Message belongs to another tenant.")
+        if message["conversation_id"] != run["conversation_id"]:
+            raise AuthorizationError("Message belongs to another conversation.")
+        if message["role"] != expected_roles[kind]:
+            raise ValueError("Message role does not match analysis link kind.")
+        connection.execute(
+            """INSERT INTO analysis_run_messages(
+                tenant_id, run_id, message_id, kind, created_at
+            ) VALUES (?, ?, ?, ?, ?)""",
+            (tenant_id, run_id, message_id, kind, utc_now()),
+        )
 
     def get_analysis_run(self, tenant_id: str, run_id: str) -> dict[str, Any]:
         with self._connect() as connection:

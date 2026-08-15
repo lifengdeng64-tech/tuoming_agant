@@ -650,7 +650,7 @@ def _render_analysis_view(
     with st.chat_message("user"):
         st.markdown(prompt)
     try:
-        safe_request = services.conversations.add_user_message(tenant_id, conversation_id, prompt)
+        request = services.conversations.add_user_message(tenant_id, conversation_id, prompt)
         context = services.conversations.build_safe_context(
             tenant_id,
             workspace_id,
@@ -665,8 +665,9 @@ def _render_analysis_view(
                 workspace_id,
                 conversation_id,
                 source_id,
-                safe_request,
+                request.safe_content,
                 context,
+                request_message_id=request.id,
             )
         if created.run["status"] == "awaiting_confirmation":
             _set_flash("success", "计划已生成，请预览并确认后再执行。")
@@ -760,6 +761,7 @@ def _render_workflow_card(
                         conversation_id,
                         result.current_plan.plan.safe_summary,
                         artifact_id,
+                        analysis_run_id=result.run["id"],
                     )
                     st.session_state[f"result-selected-{workspace_id}"] = artifact_id
                     _set_flash("success", f"分析完成，已生成制品 {artifact_id[:8]}。")
