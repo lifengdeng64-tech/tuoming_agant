@@ -95,6 +95,34 @@ def test_excel_all_sheets_and_same_name_versions(services, workspace):
     assert {item.name for item in result.artifacts} == {"book::门店", "book::客户"}
 
 
+def test_excel_ingestion_keeps_numeric_nulls_and_does_not_tokenize_them(
+    services, workspace
+):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(
+            {
+                "营收完成度": [0.8, "NaN", None, 0.0],
+                "客户": ["Alice", "NaN", None, "Bob"],
+            }
+        ).to_excel(writer, sheet_name="page", index=False)
+
+    result = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "completion.xlsx",
+        BytesIO(buffer.getvalue()),
+        {"completion::page": {"客户": ColumnPolicy("person")}},
+    )
+    artifact, loaded = services.artifacts.load("tenant-a", result.artifacts[0].id)
+
+    assert artifact.row_count == 4
+    assert loaded["营收完成度"].notna().sum() == 2
+    assert loaded["营收完成度"].dropna().tolist() == [0.8, 0.0]
+    assert loaded["客户"].isna().sum() == 2
+    assert len(services.repository.list_mappings("tenant-a")) == 2
+
+
 def test_detected_sensitive_column_fails_closed_before_persistence(services, workspace):
     content = _csv([("上海店", 100)])
     with pytest.raises(UnsafeIngestionError):

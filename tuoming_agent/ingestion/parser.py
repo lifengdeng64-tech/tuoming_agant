@@ -11,6 +11,8 @@ from typing import BinaryIO
 import openpyxl
 import pandas as pd
 
+MISSING_TEXT_MARKERS = frozenset({"nan", "n/a", "null", "none"})
+
 
 class UnsupportedFileError(ValueError):
     """Raised for unsupported or unreadable uploads."""
@@ -34,8 +36,10 @@ def iter_file_chunks(
         encoding = _detect_csv_encoding(source)
         source.seek(0)
         try:
-            for dataframe in pd.read_csv(source, encoding=encoding, chunksize=chunk_rows):
-                yield ParsedTable(stem, None, dataframe)
+            for dataframe in pd.read_csv(
+                source, encoding=encoding, chunksize=chunk_rows, skip_blank_lines=False
+            ):
+                yield ParsedTable(stem, None, _normalize_missing_values(dataframe))
         except (UnicodeDecodeError, pd.errors.ParserError) as exc:
             raise UnsupportedFileError("CSV structure could not be parsed.") from exc
         return
@@ -53,10 +57,11 @@ def iter_file_chunks(
                         continue
                     columns = _normalize_excel_headers(header)
                     while batch := list(islice(rows, chunk_rows)):
+                        dataframe = pd.DataFrame(batch, columns=columns)
                         yield ParsedTable(
                             f"{stem}::{worksheet.title}",
                             worksheet.title,
-                            pd.DataFrame(batch, columns=columns),
+                            _normalize_missing_values(dataframe),
                         )
             finally:
                 workbook.close()
@@ -97,7 +102,10 @@ def _read_csv(content: bytes | BinaryIO, sample_rows: int | None = None) -> pd.D
     for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5"):
         try:
             source.seek(0)
-            return pd.read_csv(source, encoding=encoding, nrows=sample_rows)
+            dataframe = pd.read_csv(
+                source, encoding=encoding, nrows=sample_rows, skip_blank_lines=False
+            )
+            return _normalize_missing_values(dataframe)
         except UnicodeDecodeError:
             errors.append(encoding)
         except pd.errors.ParserError as exc:
@@ -141,6 +149,18 @@ def _normalize_excel_headers(header: tuple[object, ...]) -> list[str]:
     return columns
 
 
+def _normalize_missing_values(dataframe: pd.DataFrame) -> pd.DataFrame:
+    def normalize(value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        if not stripped or stripped.casefold() in MISSING_TEXT_MARKERS:
+            return pd.NA
+        return value
+
+    return dataframe.map(normalize).infer_objects()
+
+
 def _read_excel(
     stem: str, content: bytes | BinaryIO, sample_rows: int | None = None
 ) -> list[ParsedTable]:
@@ -160,6 +180,7 @@ def _read_excel(
                 dataframe = pd.DataFrame(
                     list(islice(rows, sample_rows)), columns=_normalize_excel_headers(header)
                 )
+                dataframe = _normalize_missing_values(dataframe)
                 tables.append(
                     ParsedTable(
                         logical_name=f"{stem}::{worksheet.title}",

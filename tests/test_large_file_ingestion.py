@@ -362,6 +362,47 @@ def test_csv_encoding_retries_after_long_ascii_prefix_before_gbk_text() -> None:
     assert chunks[0].dataframe.iloc[-1, 0] == "中文"
 
 
+def test_excel_parser_normalizes_missing_markers_without_changing_business_values() -> None:
+    content = BytesIO()
+    with pd.ExcelWriter(content, engine="openpyxl") as writer:
+        pd.DataFrame(
+            {
+                "营收完成度": [
+                    0.8,
+                    "NaN",
+                    " n/A ",
+                    "NULL",
+                    "None",
+                    "  ",
+                    0,
+                    "-",
+                    "无",
+                ]
+            }
+        ).to_excel(writer, sheet_name="page", index=False)
+
+    table = preview_file("sales.xlsx", BytesIO(content.getvalue()))[0]
+
+    assert table.dataframe.loc[0, "营收完成度"] == 0.8
+    assert table.dataframe.loc[6:, "营收完成度"].tolist() == [0, "-", "无"]
+    assert table.dataframe.loc[1:5, "营收完成度"].isna().all()
+
+
+def test_csv_chunks_apply_the_same_missing_value_rules_as_preview() -> None:
+    payload = b"status\nNaN\n n/A \nNULL\nNone\n  \n0\n-\n\xe6\x9c\xaa\xe5\xae\x8c\xe6\x88\x90\n"
+
+    preview = preview_file("status.csv", BytesIO(payload))[0].dataframe
+    chunked = pd.concat(
+        [table.dataframe for table in iter_file_chunks("status.csv", BytesIO(payload), 2)],
+        ignore_index=True,
+    )
+
+    assert preview["status"].isna().iloc[:5].all()
+    assert chunked["status"].isna().iloc[:5].all()
+    assert preview["status"].iloc[5:].tolist() == ["0", "-", "未完成"]
+    assert chunked["status"].iloc[5:].tolist() == ["0", "-", "未完成"]
+
+
 def test_excel_parser_uses_cached_formula_values_and_row_chunks() -> None:
     source = BytesIO()
     with pd.ExcelWriter(source, engine="xlsxwriter") as writer:
