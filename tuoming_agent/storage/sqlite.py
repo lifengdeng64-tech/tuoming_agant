@@ -444,58 +444,60 @@ class SQLiteRepository:
                 tuple(file_record.values()),
             )
             for artifact, sheet_name, policies in tables:
-                self._publish_artifact(connection, artifact)
-                connection.execute(
-                    """INSERT OR IGNORE INTO datasets(
-                        id, tenant_id, workspace_id, logical_name, created_at
-                    ) VALUES (?, ?, ?, ?, ?)""",
-                    (str(uuid.uuid4()), tenant_id, workspace_id, artifact.name, utc_now()),
+                self._publish_dataset_table(
+                    connection,
+                    tenant_id,
+                    workspace_id,
+                    file_record["id"],
+                    artifact,
+                    sheet_name,
+                    policies,
                 )
-                dataset = connection.execute(
-                    """SELECT id FROM datasets
-                    WHERE tenant_id = ? AND workspace_id = ? AND logical_name = ?""",
-                    (tenant_id, workspace_id, artifact.name),
-                ).fetchone()
-                next_version = connection.execute(
-                    """SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_versions
-                    WHERE dataset_id = ?""",
-                    (dataset["id"],),
-                ).fetchone()[0]
-                version_id = str(uuid.uuid4())
-                connection.execute(
-                    """INSERT INTO dataset_versions(
-                        id, tenant_id, dataset_id, file_id, artifact_id,
-                        sheet_name, version, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        version_id,
-                        tenant_id,
-                        dataset["id"],
-                        file_record["id"],
-                        artifact.id,
-                        sheet_name,
-                        next_version,
-                        utc_now(),
-                    ),
-                )
-                for column_name, (domain, normalizer, key_version) in policies.items():
-                    connection.execute(
-                        """INSERT INTO column_policies(
-                            id, tenant_id, dataset_version_id, column_name,
-                            masking_domain, normalizer, key_version, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                        (
-                            str(uuid.uuid4()),
-                            tenant_id,
-                            version_id,
-                            column_name,
-                            domain,
-                            normalizer,
-                            key_version,
-                            utc_now(),
-                        ),
-                    )
             return file_record, False
+
+    def publish_tables_for_existing_file(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        file_id: str,
+        tables: list[
+            tuple[ArtifactRecord, str | None, dict[str, tuple[str, str, int]]]
+        ],
+    ) -> tuple[str, ...]:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            file_row = connection.execute(
+                "SELECT tenant_id, workspace_id FROM files WHERE id = ?", (file_id,)
+            ).fetchone()
+            if file_row is None:
+                raise RecordNotFoundError("File not found.")
+            if file_row["tenant_id"] != tenant_id:
+                raise AuthorizationError("File belongs to another tenant.")
+            if file_row["workspace_id"] != workspace_id:
+                raise AuthorizationError("File belongs to another workspace.")
+            existing_rows = connection.execute(
+                """SELECT d.logical_name FROM dataset_versions dv
+                JOIN datasets d ON d.id = dv.dataset_id
+                WHERE dv.tenant_id = ? AND dv.file_id = ?""",
+                (tenant_id, file_id),
+            ).fetchall()
+            existing_names = {row["logical_name"] for row in existing_rows}
+            published: list[str] = []
+            for artifact, sheet_name, policies in tables:
+                if artifact.name in existing_names:
+                    continue
+                self._publish_dataset_table(
+                    connection,
+                    tenant_id,
+                    workspace_id,
+                    file_id,
+                    artifact,
+                    sheet_name,
+                    policies,
+                )
+                existing_names.add(artifact.name)
+                published.append(artifact.id)
+            return tuple(published)
 
     @staticmethod
     def _publish_artifact(connection: sqlite3.Connection, artifact: ArtifactRecord) -> None:
@@ -519,6 +521,69 @@ class SQLiteRepository:
                 artifact.created_at or utc_now(),
             ),
         )
+
+    def _publish_dataset_table(
+        self,
+        connection: sqlite3.Connection,
+        tenant_id: str,
+        workspace_id: str,
+        file_id: str,
+        artifact: ArtifactRecord,
+        sheet_name: str | None,
+        policies: dict[str, tuple[str, str, int]],
+    ) -> str:
+        self._publish_artifact(connection, artifact)
+        connection.execute(
+            """INSERT OR IGNORE INTO datasets(
+                id, tenant_id, workspace_id, logical_name, created_at
+            ) VALUES (?, ?, ?, ?, ?)""",
+            (str(uuid.uuid4()), tenant_id, workspace_id, artifact.name, utc_now()),
+        )
+        dataset = connection.execute(
+            """SELECT id FROM datasets
+            WHERE tenant_id = ? AND workspace_id = ? AND logical_name = ?""",
+            (tenant_id, workspace_id, artifact.name),
+        ).fetchone()
+        next_version = connection.execute(
+            """SELECT COALESCE(MAX(version), 0) + 1 FROM dataset_versions
+            WHERE dataset_id = ?""",
+            (dataset["id"],),
+        ).fetchone()[0]
+        version_id = str(uuid.uuid4())
+        connection.execute(
+            """INSERT INTO dataset_versions(
+                id, tenant_id, dataset_id, file_id, artifact_id,
+                sheet_name, version, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                version_id,
+                tenant_id,
+                dataset["id"],
+                file_id,
+                artifact.id,
+                sheet_name,
+                next_version,
+                utc_now(),
+            ),
+        )
+        for column_name, (domain, normalizer, key_version) in policies.items():
+            connection.execute(
+                """INSERT INTO column_policies(
+                    id, tenant_id, dataset_version_id, column_name,
+                    masking_domain, normalizer, key_version, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    tenant_id,
+                    version_id,
+                    column_name,
+                    domain,
+                    normalizer,
+                    key_version,
+                    utc_now(),
+                ),
+            )
+        return version_id
 
     def get_file_versions(self, tenant_id: str, file_id: str) -> list[dict[str, Any]]:
         with self._connect() as connection:
