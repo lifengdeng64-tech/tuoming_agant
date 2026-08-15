@@ -6,11 +6,12 @@ from urllib.parse import urlparse
 
 from langchain_openai import ChatOpenAI
 
-from tuoming_agent.analysis.models import AnalysisPlan
+from tuoming_agent.analysis.models import AnalysisPlan, FillnaOperation, FilterOperation
 from tuoming_agent.analysis.naming import (
     GENERATED_NAME_RULE,
     GeneratedNameValidationError,
     generated_name_issue_paths,
+    generated_names,
 )
 from tuoming_agent.security.dlp import PromptSanitizer
 
@@ -57,7 +58,9 @@ class SafeAnalysisPlanner:
         self.model = model
         self.sanitizer = sanitizer
 
-    def create_plan(self, safe_request: str, safe_context: dict[str, Any]) -> AnalysisPlan:
+    def create_plan(
+        self, safe_request: str, safe_context: dict[str, Any], tenant_id: str
+    ) -> AnalysisPlan:
         payload_data = {
             "request": safe_request,
             "workspace_context": safe_context,
@@ -81,7 +84,15 @@ class SafeAnalysisPlanner:
                 if isinstance(result, AnalysisPlan)
                 else AnalysisPlan.model_validate(result)
             )
-            self.sanitizer.assert_safe(f"{plan.result_name}\n{plan.safe_summary}")
+            self.sanitizer.assert_tenant_safe(
+                tenant_id,
+                json.dumps(
+                    _model_generated_values(plan),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                ),
+            )
             issue_paths = generated_name_issue_paths(plan)
             if not issue_paths:
                 return plan
@@ -98,6 +109,16 @@ class SafeAnalysisPlanner:
             }
 
         raise AssertionError("Planner retry loop exhausted unexpectedly.")
+
+
+def _model_generated_values(plan: AnalysisPlan) -> list[Any]:
+    values: list[Any] = [plan.safe_summary, *generated_names(plan)]
+    for operation in plan.operations:
+        if isinstance(operation, FilterOperation):
+            values.append(operation.value)
+        elif isinstance(operation, FillnaOperation):
+            values.extend(operation.values.values())
+    return values
 
 
 def _structured_output_method(base_url: str | None) -> str:

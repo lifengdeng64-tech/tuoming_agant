@@ -39,6 +39,12 @@ def generated_name_issue_paths(plan: AnalysisPlan) -> tuple[str, ...]:
     )
 
 
+def generated_names(plan: AnalysisPlan) -> tuple[str, ...]:
+    return tuple(
+        name for _diagnostic_path, _feedback_path, name in _generated_name_candidates(plan)
+    )
+
+
 def _generated_name_candidates(plan: AnalysisPlan) -> list[tuple[str, str, str]]:
     candidates = [("result_name", "result_name", plan.result_name)]
     for operation_index, operation in enumerate(plan.operations):

@@ -32,7 +32,9 @@ def test_outbound_model_request_contains_no_plaintext_pii(services, workspace):
     )
     model = RecordingModel(plan)
     planner = SafeAnalysisPlanner(None, None, "test", sanitizer, model=model)
-    planner.create_plan(safe_request, {"artifact_catalog": [], "recent_messages": []})
+    planner.create_plan(
+        safe_request, {"artifact_catalog": [], "recent_messages": []}, "tenant-a"
+    )
     serialized = json.dumps(model.messages, ensure_ascii=False)
     assert "13800138000" not in serialized
     assert "PHONE_V1_" in serialized
@@ -47,7 +49,7 @@ def test_planner_rejects_sensitive_content_in_model_output(services):
     )
     planner = SafeAnalysisPlanner(None, None, "test", sanitizer, model=RecordingModel(plan))
     with pytest.raises(SensitiveContentError):
-        planner.create_plan("safe request", {})
+        planner.create_plan("safe request", {}, "tenant-a")
 
 
 def test_unknown_plaintext_pii_is_blocked(services):

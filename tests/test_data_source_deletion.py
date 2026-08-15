@@ -10,7 +10,7 @@ import pytest
 
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
-from tuoming_agent.storage.sqlite import DeletionImpact
+from tuoming_agent.storage.sqlite import DeletionImpact, SQLiteRepository
 from tuoming_agent.workspace.data_sources import DataSourceDeletionError
 
 
@@ -570,6 +570,63 @@ def test_legacy_request_matching_uses_nearest_prior_duplicate_message(
     assert second_request.id not in impact.message_ids
     assert second_response.id not in impact.message_ids
     assert impact.analysis_run_ids == (first_run["id"],)
+
+
+def test_pre_message_link_schema_upgrade_preserves_data_and_legacy_fallback(
+    services, workspace, config
+):
+    ingested = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "legacy-schema.csv",
+        pd.DataFrame({"value": [1]}).to_csv(index=False).encode(),
+        {"legacy-schema": {}},
+    )
+    source = ingested.artifacts[0]
+    conversation = services.repository.create_conversation("tenant-a", workspace.id)
+    legacy_request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "legacy schema request"
+    )
+    legacy_run = services.repository.create_analysis_run(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        source.id,
+        legacy_request.safe_content,
+        {},
+        3,
+    )
+    with services.repository._connect() as connection:
+        connection.execute("DROP TABLE analysis_run_messages")
+
+    upgraded = SQLiteRepository(config.database_path)
+    upgraded.initialize()
+
+    preserved_workspace = upgraded.get_workspace("tenant-a", workspace.id)
+    assert preserved_workspace.id == workspace.id
+    assert preserved_workspace.name == workspace.name
+    assert upgraded.get_analysis_run("tenant-a", legacy_run["id"])["id"] == legacy_run["id"]
+    assert upgraded.list_analysis_run_messages("tenant-a", legacy_run["id"]) == []
+    impact = upgraded.inspect_file_deletion("tenant-a", workspace.id, ingested.file_id)
+    assert legacy_request.id in impact.message_ids
+
+    linked_request = upgraded.add_message(
+        "tenant-a", conversation["id"], "user", "linked after upgrade"
+    )
+    linked_run = upgraded.create_analysis_run(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        source.id,
+        linked_request.safe_content,
+        {},
+        3,
+        request_message_id=linked_request.id,
+    )
+    links = upgraded.list_analysis_run_messages("tenant-a", linked_run["id"])
+    assert [(item["id"], item["kind"]) for item in links] == [
+        (linked_request.id, "request")
+    ]
 
 
 def test_inspect_dataset_version_deletion_finds_only_selected_sheet_descendants(

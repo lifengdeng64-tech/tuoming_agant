@@ -37,6 +37,14 @@ class PromptSanitizer:
         self.assert_safe(safe_text, forbidden_values=[value for value, _ in known_values])
         return safe_text
 
+    def assert_tenant_safe(self, tenant_id: str, text: str) -> None:
+        self.assert_safe(
+            text,
+            forbidden_values=[
+                plaintext for plaintext, _token in self.vault.iter_plaintext_tokens(tenant_id)
+            ],
+        )
+
     @staticmethod
     def assert_safe(text: str, forbidden_values: list[str] | None = None) -> None:
         for category, pattern in PII_PATTERNS.items():

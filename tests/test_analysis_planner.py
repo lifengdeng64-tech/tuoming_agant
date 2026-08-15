@@ -102,7 +102,7 @@ def test_planner_sends_exact_analysis_plan_schema_with_json_request(services) ->
         model=model,
     )
 
-    planner.create_plan("group revenue", {"artifact_catalog": []})
+    planner.create_plan("group revenue", {"artifact_catalog": []}, "tenant-a")
 
     user_payload = json.loads(model.messages[1][1])
     assert user_payload["analysis_plan_schema"] == AnalysisPlan.model_json_schema()
@@ -199,7 +199,7 @@ def test_planner_retries_once_with_safe_generated_name_feedback(services) -> Non
                             {
                                 "column": "revenue",
                                 "function": "sum",
-                                "output": "华住_revenue",
+                                "output": "current_revenue",
                             }
                         ],
                     }
@@ -228,7 +228,7 @@ def test_planner_retries_once_with_safe_generated_name_feedback(services) -> Non
         model=model,
     )
 
-    plan = planner.create_plan("汇总营收", {"artifact_catalog": []})
+    plan = planner.create_plan("汇总营收", {"artifact_catalog": []}, "tenant-a")
 
     assert plan.result_name == "品牌营收分析"
     assert len(model.calls) == 2
@@ -242,7 +242,7 @@ def test_planner_retries_once_with_safe_generated_name_feedback(services) -> Non
     retry_payload = model.calls[1][1][1]
     assert token not in retry_payload
     assert "华住" not in retry_payload
-    assert "华住_revenue" not in retry_payload
+    assert "current_revenue" not in retry_payload
 
 
 def test_planner_rejects_second_invalid_generated_name_response(services) -> None:
@@ -264,6 +264,6 @@ def test_planner_rejects_second_invalid_generated_name_response(services) -> Non
         GeneratedNameValidationError,
         match="模型未能生成合规的中文字段名称",
     ):
-        planner.create_plan("汇总营收", {"artifact_catalog": []})
+        planner.create_plan("汇总营收", {"artifact_catalog": []}, "tenant-a")
 
     assert len(model.calls) == 2
