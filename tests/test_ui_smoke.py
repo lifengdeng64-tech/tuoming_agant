@@ -364,10 +364,13 @@ def test_streamlit_restores_pending_plan_and_requires_confirmation(monkeypatch, 
         {},
         3,
     )
+    token = services.vault.tokenize("ui-workflow-tenant", "brand", "华住")
     plan = AnalysisPlan(
         input_artifact_id=source.id,
         result_name="销售预览",
-        operations=[{"action": "head", "rows": 1}],
+        operations=[
+            {"action": "filter", "column": "品牌名称", "operator": "eq", "value": token}
+        ],
     )
     services.repository.create_analysis_plan_version(
         "ui-workflow-tenant", run["id"], plan.model_dump(mode="json"), "initial"
@@ -388,3 +391,9 @@ def test_streamlit_restores_pending_plan_and_requires_confirmation(monkeypatch, 
     assert "拒绝计划" in [button.label for button in app.button]
     assert any("等待确认" in item.value for item in app.subheader)
     assert any("结果名称：销售预览" in item.value for item in app.markdown)
+    assert any("'华住'" in item.value for item in app.markdown)
+
+    stored_plan = services.repository.list_analysis_plan_versions(
+        "ui-workflow-tenant", run["id"]
+    )[0]
+    assert stored_plan["plan"]["operations"][0]["value"] == token

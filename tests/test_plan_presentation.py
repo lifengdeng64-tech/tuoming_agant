@@ -22,3 +22,50 @@ def test_describe_plan_returns_readable_chinese_instead_of_json():
     assert "按“门店”分组" in preview[3]
     assert not any("{\"" in line for line in preview)
 
+
+def test_restore_display_value_preserves_non_tokens_and_tenant_boundaries(services):
+    tenant_token = services.vault.tokenize("tenant-a", "brand", "华住")
+    other_tenant_token = services.vault.tokenize("tenant-b", "brand", "如家")
+    unknown_token = "brand_V1_UNKNOWN"
+
+    value = {
+        "items": [tenant_token, "普通文本", unknown_token, other_tenant_token],
+        "nested": {"tuple": (tenant_token, 7)},
+    }
+
+    restored = services.masking.restore_display_value("tenant-a", value)
+
+    assert restored == {
+        "items": ["华住", "普通文本", unknown_token, other_tenant_token],
+        "nested": {"tuple": ("华住", 7)},
+    }
+
+
+def test_describe_plan_restores_only_displayed_filter_and_fill_values(services):
+    token = services.vault.tokenize("tenant-a", "brand", "华住")
+    protected_token = services.vault.tokenize("tenant-a", "metadata", "不应展示")
+    plan = AnalysisPlan(
+        input_artifact_id=protected_token,
+        result_name=protected_token,
+        operations=[
+            {"action": "filter", "column": protected_token, "operator": "eq", "value": token},
+            {
+                "action": "fillna",
+                "values": {protected_token: {"preferred": token}, "备注": [token, "未知"]},
+            },
+            {"action": "derive", "column": protected_token, "expression": protected_token},
+        ],
+    )
+
+    lines = describe_plan(
+        plan,
+        resolve_value=lambda value: services.masking.restore_display_value("tenant-a", value),
+    )
+
+    rendered = "\n".join(lines)
+    assert "'华住'" in rendered
+    assert token not in rendered
+    assert rendered.count(protected_token) == 6
+    assert plan.operations[0].value == token
+    assert plan.operations[1].values[protected_token]["preferred"] == token
+

@@ -726,7 +726,12 @@ def _render_workflow_card(
         )
 
         if snapshot.plan_versions:
-            for line in describe_plan(snapshot.current_plan.plan):
+            for line in describe_plan(
+                snapshot.current_plan.plan,
+                resolve_value=lambda value: services.masking.restore_display_value(
+                    tenant_id, value
+                ),
+            ):
                 st.markdown(f"- {line}")
             if snapshot.current_plan.reason == "repair" and snapshot.run["error_message"]:
                 st.warning(f"上次执行未通过：{snapshot.run['error_message']}")

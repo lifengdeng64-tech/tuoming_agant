@@ -7,6 +7,7 @@ import pandas as pd
 
 from tuoming_agent.models import ColumnLineage
 from tuoming_agent.security.vault import TokenVault
+from tuoming_agent.storage.errors import RecordNotFoundError
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,23 @@ class MaskingService:
                 else value
             )
         return restored
+
+    def restore_display_value(self, tenant_id: str, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: self.restore_display_value(tenant_id, item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self.restore_display_value(tenant_id, item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self.restore_display_value(tenant_id, item) for item in value)
+        if isinstance(value, str):
+            try:
+                return self.vault.resolve(tenant_id, value)
+            except RecordNotFoundError:
+                return value
+        return value
 
     @staticmethod
     def _is_null(value: Any) -> bool:
