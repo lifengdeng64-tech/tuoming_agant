@@ -5,8 +5,11 @@ import pytest
 
 from tuoming_agent.analysis.executor import AnalysisResourceError
 from tuoming_agent.analysis.models import AnalysisPlan
+from tuoming_agent.analysis.naming import GeneratedNameValidationError
+from tuoming_agent.analysis.planner import SafeAnalysisPlanner
 from tuoming_agent.analysis.quality import QualityIssue, QualityReport
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService
+from tuoming_agent.security.dlp import PromptSanitizer
 from tuoming_agent.storage.errors import AuthorizationError
 
 
@@ -18,6 +21,14 @@ class QueuePlanner:
     def create_plan(self, safe_request: str, safe_context: dict) -> AnalysisPlan:
         self.calls.append((safe_request, safe_context))
         return self.plans.pop(0)
+
+
+class SequencePlanModel:
+    def __init__(self, responses):
+        self.responses = list(responses)
+
+    def invoke(self, _messages):
+        return self.responses.pop(0)
 
 
 def _source(services, workspace):
@@ -92,6 +103,40 @@ def test_request_message_links_an_analysis_run_and_response(services, workspace)
     links = services.repository.list_analysis_run_messages("tenant-a", started.run["id"])
 
     assert [item["kind"] for item in links] == ["request", "response"]
+
+
+def test_invalid_generated_names_never_persist_a_plan_version(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    invalid = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="revenue report",
+        operations=[{"action": "head", "rows": 5}],
+    )
+    planner = SafeAnalysisPlanner(
+        None,
+        None,
+        "test",
+        PromptSanitizer(services.vault),
+        model=SequencePlanModel([invalid, invalid]),
+    )
+    workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
+
+    with pytest.raises(GeneratedNameValidationError):
+        workflow.start(
+            "tenant-a",
+            workspace.id,
+            conversation["id"],
+            source.id,
+            "汇总营收",
+            {},
+        )
+
+    run = services.repository.list_analysis_runs(
+        "tenant-a", workspace.id, conversation["id"]
+    )[0]
+    assert run["status"] == "failed"
+    assert services.repository.list_analysis_plan_versions("tenant-a", run["id"]) == []
 
 
 def test_analysis_run_message_links_reject_other_conversation_and_tenant(services, workspace):

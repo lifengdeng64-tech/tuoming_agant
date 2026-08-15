@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from tuoming_agent.analysis.naming import GeneratedNameValidationError
 from tuoming_agent.analysis.planner import SafeAnalysisPlanner
 from tuoming_agent.analysis.presentation import describe_plan
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService, WorkflowSnapshot
@@ -682,6 +683,8 @@ def _render_analysis_view(
         elif created.run["status"] == "security_blocked":
             _set_flash("error", "计划触发安全拒绝，已阻止且不会自动修复。")
         st.rerun()
+    except GeneratedNameValidationError as exc:
+        st.error(str(exc))
     except (SensitiveContentError, ValueError) as exc:
         st.error(str(exc))
     except Exception:

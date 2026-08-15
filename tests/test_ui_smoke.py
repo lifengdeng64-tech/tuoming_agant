@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 from streamlit.testing.v1 import AppTest
 
 from tuoming_agent.analysis.models import AnalysisPlan
+from tuoming_agent.analysis.naming import GeneratedNameValidationError
 from tuoming_agent.config import AppConfig
 from tuoming_agent.storage.sqlite import DeletionImpact, TableDeletionImpact
 from tuoming_agent.ui import app as ui_app
@@ -58,6 +60,86 @@ def test_upload_button_uses_confirm_add_label(monkeypatch):
 
     assert "确认添加" in labels
     assert not any(label.startswith("确认并追加") for label in labels)
+
+
+def test_generated_name_error_is_shown_in_chinese(monkeypatch, tmp_path: Path):
+    message = "模型未能生成合规的中文字段名称，请重试。"
+
+    class Conversations:
+        sanitizer = object()
+
+        @staticmethod
+        def add_user_message(*_args):
+            return SimpleNamespace(id="message-a", safe_content="汇总营收")
+
+        @staticmethod
+        def build_safe_context(*_args, **_kwargs):
+            return {}
+
+    class Repository:
+        @staticmethod
+        def list_messages(*_args, **_kwargs):
+            return []
+
+        @staticmethod
+        def add_audit_event(*_args, **_kwargs):
+            raise AssertionError("中文命名错误不应进入通用异常处理")
+
+    class Workflow:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def latest_for_conversation(*_args):
+            return None
+
+        @staticmethod
+        def start(*_args, **_kwargs):
+            raise GeneratedNameValidationError(message)
+
+    services = SimpleNamespace(
+        artifacts=object(),
+        conversations=Conversations(),
+        repository=Repository(),
+    )
+    artifact = SimpleNamespace(
+        id="artifact-a",
+        schema={"columns": [{"name": "revenue"}]},
+        row_count=2,
+        lineage=(),
+    )
+    config = AppConfig(
+        master_key=b"k" * 32,
+        key_version=1,
+        data_dir=tmp_path,
+        default_tenant="tenant-a",
+        analyst_api_key="test-key",
+    )
+    errors: list[str] = []
+
+    monkeypatch.setattr(ui_app, "SafeAnalysisPlanner", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(ui_app, "AnalysisWorkflowService", Workflow)
+    monkeypatch.setattr(ui_app, "_section_heading", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app, "_empty_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "selectbox", lambda *_args, **_kwargs: "artifact-a")
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "divider", lambda: None)
+    monkeypatch.setattr(ui_app.st, "markdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "chat_input", lambda *_args, **_kwargs: "汇总营收")
+    monkeypatch.setattr(ui_app.st, "chat_message", lambda *_args, **_kwargs: _EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "spinner", lambda *_args, **_kwargs: _EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "error", errors.append)
+
+    ui_app._render_analysis_view(
+        services,
+        config,
+        "tenant-a",
+        "workspace-a",
+        "conversation-a",
+        [artifact],
+    )
+
+    assert errors == [message]
 
 
 def test_table_deletion_requires_acknowledgement_for_related_analysis(monkeypatch):
