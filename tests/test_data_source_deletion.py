@@ -41,17 +41,25 @@ def _source_graph(services, workspace):
         (direct.id,),
     )
     conversation = services.repository.get_or_create_conversation("tenant-a", workspace.id)
+    request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "汇总营收"
+    )
     run = services.repository.create_analysis_run(
         "tenant-a",
         workspace.id,
         conversation["id"],
         source.id,
-        "group revenue",
+        request.safe_content,
         {},
         3,
+        request_message_id=request.id,
     )
     services.conversations.add_assistant_message(
-        "tenant-a", conversation["id"], "result ready", descendant.id
+        "tenant-a",
+        conversation["id"],
+        "result ready",
+        descendant.id,
+        analysis_run_id=run["id"],
     )
     return ingested, source, direct, descendant, conversation, run
 
@@ -98,17 +106,25 @@ def _two_sheet_graph(services, workspace):
     conversation = services.repository.get_or_create_conversation(
         "tenant-a", workspace.id
     )
+    request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "汇总营收"
+    )
     run = services.repository.create_analysis_run(
         "tenant-a",
         workspace.id,
         conversation["id"],
         source.id,
-        "sum values",
+        request.safe_content,
         {},
         3,
+        request_message_id=request.id,
     )
     services.conversations.add_assistant_message(
-        "tenant-a", conversation["id"], "result ready", descendant.id
+        "tenant-a",
+        conversation["id"],
+        "result ready",
+        descendant.id,
+        analysis_run_id=run["id"],
     )
     file_record = services.repository.find_file_by_hash(
         "tenant-a", workspace.id, ingested.content_hash
@@ -357,7 +373,7 @@ def test_delete_file_metadata_rolls_back_when_file_delete_fails(services, worksp
 
 
 def test_data_source_service_removes_files_and_metadata(services, workspace):
-    ingested, source, direct, descendant, *_ = _source_graph(services, workspace)
+    ingested, source, direct, descendant, conversation, _run = _source_graph(services, workspace)
     impact = services.data_sources.inspect("tenant-a", workspace.id, ingested.file_id)
     original_paths = tuple(impact.paths)
 
@@ -370,6 +386,11 @@ def test_data_source_service_removes_files_and_metadata(services, workspace):
     assert not source.path.exists()
     assert not direct.path.exists()
     assert not descendant.path.exists()
+    messages = services.repository.list_messages("tenant-a", conversation["id"])
+    assert [message.safe_content for message in messages] == [
+        "汇总营收",
+        "result ready",
+    ]
 
 
 def test_data_source_service_deletes_only_selected_table_files(services, workspace):
@@ -389,6 +410,10 @@ def test_data_source_service_deletes_only_selected_table_files(services, workspa
     assert graph["other_sheet"].path.exists()
     assert len(services.repository.list_files("tenant-a", workspace.id)) == 1
     assert not (services.data_sources.data_dir / ".trash").exists()
+    assert [
+        message.safe_content
+        for message in services.repository.list_messages("tenant-a", graph["conversation"]["id"])
+    ] == ["汇总营收", "result ready"]
 
 
 def test_data_source_service_restores_table_files_when_metadata_delete_fails(

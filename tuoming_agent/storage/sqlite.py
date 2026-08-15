@@ -661,6 +661,13 @@ class SQLiteRepository:
             )
             self._delete_ids(
                 connection,
+                "analysis_run_messages",
+                "run_id",
+                actual.analysis_run_ids,
+                tenant_id,
+            )
+            self._delete_ids(
+                connection,
                 "analysis_runs",
                 "id",
                 actual.analysis_run_ids,
@@ -767,6 +774,13 @@ class SQLiteRepository:
             )
             self._delete_ids(
                 connection,
+                "analysis_run_messages",
+                "run_id",
+                actual.analysis_run_ids,
+                tenant_id,
+            )
+            self._delete_ids(
+                connection,
                 "analysis_runs",
                 "id",
                 actual.analysis_run_ids,
@@ -846,6 +860,7 @@ class SQLiteRepository:
         allowed = {
             ("analysis_plan_versions", "run_id"),
             ("analysis_attempts", "run_id"),
+            ("analysis_run_messages", "run_id"),
             ("analysis_runs", "id"),
             ("column_policies", "dataset_version_id"),
             ("dataset_versions", "id"),
@@ -1425,7 +1440,7 @@ class SQLiteRepository:
                 FROM analysis_run_messages
                 JOIN messages ON messages.id = analysis_run_messages.message_id
                 WHERE analysis_run_messages.tenant_id = ? AND analysis_run_messages.run_id = ?
-                ORDER BY analysis_run_messages.created_at""",
+                ORDER BY analysis_run_messages.created_at, analysis_run_messages.message_id""",
                 (tenant_id, run_id),
             ).fetchall()
         return [dict(row) for row in rows]
