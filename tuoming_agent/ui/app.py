@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import html
+import json
+import os
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -9,37 +12,54 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from tuoming_agent import __version__
 from tuoming_agent.analysis.planner import SafeAnalysisPlanner
 from tuoming_agent.analysis.presentation import describe_plan
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService, WorkflowSnapshot
+from tuoming_agent.backup import BackupError, BackupManager
 from tuoming_agent.config import AppConfig, ConfigurationError
+from tuoming_agent.desktop.updater import UpdateError, UpdateManager
 from tuoming_agent.exporting import ExportLimitError
 from tuoming_agent.ingestion.limits import validate_upload_size
 from tuoming_agent.ingestion.parser import preview_file
 from tuoming_agent.ingestion.scanner import detect_sensitive_columns
 from tuoming_agent.maintenance import DiskHeadroomError
+from tuoming_agent.providers import create_provider
 from tuoming_agent.security.dlp import SensitiveContentError
 from tuoming_agent.security.masking import ColumnPolicy
+from tuoming_agent.settings import (
+    PROVIDER_BY_ID,
+    PROVIDERS,
+    LocalSettingsManager,
+    ModelSettings,
+    NetworkSettings,
+    default_app_dir,
+)
 from tuoming_agent.ui.styles import APP_STYLES
 from tuoming_agent.workspace.service import ApplicationServices, create_services
 
-VIEW_OPTIONS = ("概览", "数据", "分析", "结果")
+VIEW_OPTIONS = ("概览", "数据", "分析", "结果", "设置")
 NORMALIZERS = ("text", "casefold", "phone", "identifier")
 
 
 def run() -> None:
     st.set_page_config(
-        page_title="透明数据安全工作台",
+        page_title="Tuoming Agent",
         page_icon="🛡️",
         layout="wide",
         initial_sidebar_state="collapsed",
     )
     st.markdown(APP_STYLES, unsafe_allow_html=True)
     try:
-        config = AppConfig.from_env()
+        config = AppConfig.from_runtime()
     except ConfigurationError as exc:
         _render_configuration_error(str(exc))
         st.stop()
+
+    settings_manager = LocalSettingsManager(config.app_dir or default_app_dir())
+    if config.managed_runtime and not config.analyst_api_key:
+        _render_first_run(settings_manager, config)
+        return
 
     services = _load_services(config)
     tenant_id = config.default_tenant
@@ -75,8 +95,12 @@ def run() -> None:
             conversation["id"],
             artifacts,
         )
-    else:
+    elif selected_view == "结果":
         _render_results_view(services, tenant_id, workspace_id, artifacts)
+    else:
+        _render_settings(
+            settings_manager, config, services, tenant_id, workspace_id
+        )
 
 
 @st.cache_resource(show_spinner=False)
@@ -85,9 +109,9 @@ def _load_services(config: AppConfig) -> ApplicationServices:
 
 
 def _render_configuration_error(message: str) -> None:
-    st.title("数据安全工作台")
+    st.title("Tuoming Agent 无法启动")
     st.error(message)
-    st.code("python -m tuoming_agent.keygen", language="powershell")
+    st.caption("程序没有覆盖已有密钥或历史数据。请先备份本地数据，再根据提示恢复。")
 
 
 def _workspace_sidebar(services: ApplicationServices, config: AppConfig, tenant_id: str) -> str:
@@ -136,7 +160,8 @@ def _workspace_sidebar(services: ApplicationServices, config: AppConfig, tenant_
             st.rerun()
 
     st.sidebar.divider()
-    model_state = "已连接" if config.analyst_api_key else "未配置"
+    provider = PROVIDER_BY_ID.get(config.analyst_provider, PROVIDER_BY_ID["openai_compatible"])
+    model_state = provider.label if config.analyst_api_key else "未配置"
     safe_tenant_id = html.escape(tenant_id)
     st.sidebar.markdown(
         f"""
@@ -148,7 +173,20 @@ def _workspace_sidebar(services: ApplicationServices, config: AppConfig, tenant_
         """,
         unsafe_allow_html=True,
     )
-    st.sidebar.caption("v0.2 · Local-first")
+    if (
+        config.managed_runtime
+        and os.getenv("TUOMING_DESKTOP") == "1"
+        and st.sidebar.button(
+            "退出 Tuoming Agent",
+            icon=":material/power_settings_new:",
+            use_container_width=True,
+        )
+    ):
+        if config.app_dir:
+            (config.app_dir / "shutdown.request").write_text("quit", encoding="utf-8")
+        st.sidebar.info("正在安全关闭本地服务…")
+        st.stop()
+    st.sidebar.caption("v0.3 · Local-first desktop")
     return selected
 
 
@@ -197,6 +235,398 @@ def _view_navigation() -> str:
     if requested != selected:
         st.query_params["view"] = selected
     return selected
+
+
+def _render_first_run(settings_manager: LocalSettingsManager, config: AppConfig) -> None:
+    st.markdown(
+        """
+        <div class="onboarding-hero">
+            <div class="brand-mark onboarding-mark">T</div>
+            <div>
+                <span class="eyebrow">WELCOME TO TUOMING AGENT</span>
+                <h1>连接你的分析模型</h1>
+                <p>本地安全空间已经创建。完成一次模型配置后，就可以进入工作台。</p>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    trust_columns = st.columns(3)
+    trust_columns[0].markdown("**原始数据留在本机**\n\n模型只接收脱敏后的请求与元数据。")
+    trust_columns[1].markdown("**密钥由 Windows 保护**\n\nAPI Key 与脱敏主密钥使用 DPAPI 保存。")
+    trust_columns[2].markdown("**以后直接进入工作台**\n\n设置保存后，重启无需重复填写。")
+    st.divider()
+    _render_model_settings_form(settings_manager, config, prefix="onboarding", first_run=True)
+
+
+def _render_settings(
+    settings_manager: LocalSettingsManager,
+    config: AppConfig,
+    services: ApplicationServices,
+    tenant_id: str,
+    workspace_id: str,
+) -> None:
+    model_tab, network_tab, resilience_tab, update_tab = st.tabs(
+        ["模型", "企业网络", "备份与恢复", "更新与审计"]
+    )
+    with model_tab:
+        _render_model_settings(settings_manager, config)
+    with network_tab:
+        _render_network_settings(settings_manager, config)
+    with resilience_tab:
+        _render_backup_settings(settings_manager, config)
+    with update_tab:
+        _render_update_settings(settings_manager, config, services, tenant_id, workspace_id)
+
+
+def _render_network_settings(
+    settings_manager: LocalSettingsManager, config: AppConfig
+) -> None:
+    _section_heading("企业网络", "代理与 TLS")
+    st.caption(
+        "始终验证 TLS；Tuoming 不提供关闭证书校验的选项。"
+        "代理凭据请配置在 Windows 系统代理中。"
+    )
+    saved = settings_manager.load_network_settings()
+    use_system_proxy = st.checkbox(
+        "使用 Windows/环境系统代理",
+        value=saved.use_system_proxy,
+        key="network-use-system-proxy",
+    )
+    proxy_url = st.text_input(
+        "显式代理 URL（可选）",
+        value=saved.proxy_url,
+        placeholder="http://proxy.company.local:8080",
+        help="不得包含用户名或密码。",
+        key="network-proxy-url",
+    )
+    ca_bundle_path = st.text_input(
+        "企业 CA 文件路径（可选）",
+        value=saved.ca_bundle_path,
+        placeholder=r"C:\Company\certs\enterprise-ca.pem",
+        key="network-ca-path",
+    )
+    if st.button("保存网络设置", type="primary", key="network-save"):
+        try:
+            settings_manager.save_network_settings(
+                NetworkSettings(use_system_proxy, proxy_url, ca_bundle_path)
+            )
+            _set_flash("success", "企业网络设置已保存，重启 Tuoming 后对全部 Provider 生效。")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+def _render_backup_settings(
+    settings_manager: LocalSettingsManager, config: AppConfig
+) -> None:
+    _section_heading("备份与恢复", "可迁移加密备份")
+    st.caption(
+        "备份包含工作区、脱敏制品和迁移所需凭据；使用独立密码加密。密码不会保存，丢失后无法恢复。"
+    )
+    backup_password = st.text_input(
+        "新备份密码",
+        type="password",
+        key="backup-password",
+        help="至少 10 个字符。",
+    )
+    if st.button("创建加密备份", key="create-backup"):
+        try:
+            backup_dir = (config.app_dir or default_app_dir()) / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            name = datetime.now().strftime("TuomingAgent-%Y%m%d-%H%M%S.tmbak")
+            path = BackupManager(
+                config.app_dir or default_app_dir(), config.data_dir, settings_manager
+            ).create_backup(backup_dir / name, backup_password)
+            st.session_state["latest-backup"] = str(path)
+            st.success(f"备份已创建：{path}")
+        except BackupError as exc:
+            st.error(str(exc))
+    latest_backup = st.session_state.get("latest-backup")
+    if latest_backup and Path(latest_backup).is_file():
+        backup_path = Path(latest_backup)
+        if backup_path.stat().st_size <= 250 * 1024 * 1024:
+            st.download_button(
+                "下载刚创建的备份",
+                data=backup_path.read_bytes(),
+                file_name=backup_path.name,
+                mime="application/octet-stream",
+                key="download-backup",
+            )
+        else:
+            st.info("备份超过 250MiB，请直接从上方本地路径复制，避免浏览器占用过多内存。")
+
+    st.divider()
+    restore_upload = st.file_uploader(
+        "选择 .tmbak 备份",
+        type=["tmbak"],
+        key="restore-upload",
+    )
+    restore_password = st.text_input("备份密码", type="password", key="restore-password")
+    if st.button("验证并安排恢复", key="stage-restore", disabled=restore_upload is None):
+        try:
+            import_dir = (config.app_dir or default_app_dir()) / "restore-imports"
+            import_dir.mkdir(parents=True, exist_ok=True)
+            source = import_dir / f"{uuid.uuid4().hex}.tmbak"
+            source.write_bytes(restore_upload.getvalue())
+            try:
+                BackupManager(
+                    config.app_dir or default_app_dir(), config.data_dir, settings_manager
+                ).stage_restore(source, restore_password)
+            finally:
+                source.unlink(missing_ok=True)
+            st.success("备份已验证。请从系统托盘退出并重新启动 Tuoming，恢复将在启动前完成。")
+        except BackupError as exc:
+            st.error(str(exc))
+
+
+def _render_update_settings(
+    settings_manager: LocalSettingsManager,
+    config: AppConfig,
+    services: ApplicationServices,
+    tenant_id: str,
+    workspace_id: str,
+) -> None:
+    _section_heading("更新与审计", f"当前版本 {__version__}")
+    st.caption("仅从官方 GitHub Releases 检查更新；安装前验证 SHA-256，并可绑定发布证书指纹。")
+    if st.button("检查更新", key="check-update"):
+        manager = UpdateManager(config.app_dir or default_app_dir(), config.network_settings)
+        try:
+            update = manager.check()
+            st.session_state["available-update"] = update
+            if update.is_newer:
+                st.success(f"发现新版本 {update.version}。")
+            else:
+                st.info("当前已经是最新版。")
+        except UpdateError as exc:
+            st.error(str(exc))
+        finally:
+            manager.close()
+    update = st.session_state.get("available-update")
+    if update and update.is_newer and st.button("下载并验证更新", key="download-update"):
+        manager = UpdateManager(config.app_dir or default_app_dir(), config.network_settings)
+        try:
+            downloaded = manager.download(update)
+            st.session_state["downloaded-update"] = str(downloaded.path)
+            st.success(f"更新已验证并下载：{downloaded.path.name}。点击下方按钮开始安装。")
+        except UpdateError as exc:
+            st.error(str(exc))
+        finally:
+            manager.close()
+    downloaded_path = st.session_state.get("downloaded-update")
+    if (
+        downloaded_path
+        and Path(downloaded_path).is_file()
+        and st.button("退出并安装更新", type="primary", key="install-update")
+    ):
+        manager = UpdateManager(config.app_dir or default_app_dir(), config.network_settings)
+        try:
+            manager.launch_installer(Path(downloaded_path))
+            ((config.app_dir or default_app_dir()) / "shutdown.request").write_text(
+                "update", encoding="utf-8"
+            )
+            st.info("安装器已启动，Tuoming 正在退出。")
+        except UpdateError as exc:
+            st.error(str(exc))
+        finally:
+            manager.close()
+
+    rollback_manager = UpdateManager(
+        config.app_dir or default_app_dir(), config.network_settings
+    )
+    try:
+        rollback_candidates = rollback_manager.rollback_candidates()
+    finally:
+        rollback_manager.close()
+    if rollback_candidates:
+        st.divider()
+        rollback_by_label = {
+            f"版本 {item['version']} · 签名 {item['signature_status']}": item["path"]
+            for item in rollback_candidates
+        }
+        rollback_label = st.selectbox(
+            "已验证安装器（可用于回滚）",
+            options=list(rollback_by_label),
+            key="rollback-installer",
+        )
+        if st.button("退出并安装所选版本", key="install-rollback"):
+            manager = UpdateManager(
+                config.app_dir or default_app_dir(), config.network_settings
+            )
+            try:
+                manager.launch_installer(Path(rollback_by_label[rollback_label]))
+                ((config.app_dir or default_app_dir()) / "shutdown.request").write_text(
+                    "rollback", encoding="utf-8"
+                )
+                st.info("回滚安装器已启动，Tuoming 正在退出。")
+            except UpdateError as exc:
+                st.error(str(exc))
+            finally:
+                manager.close()
+
+    st.caption(
+        "当前版本按 Windows 用户隔离数据与 DPAPI 凭据；企业身份联合与集中 SIEM "
+        "推送需在部署时接入。"
+    )
+    events = services.repository.list_audit_events(tenant_id, workspace_id, 5000)
+    audit_lines = "\n".join(
+        json.dumps(
+            {
+                "event_id": event["id"],
+                "event_type": event["event_type"],
+                "created_at": event["created_at"],
+                "details": event["details"],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for event in reversed(events)
+    )
+    st.download_button(
+        "导出当前工作区安全审计 JSONL",
+        data=audit_lines.encode("utf-8"),
+        file_name=f"tuoming-audit-{workspace_id}.jsonl",
+        mime="application/x-ndjson",
+        key="download-audit",
+        help="审计导出不包含原始行、密钥或解密后的映射值。",
+    )
+
+def _render_model_settings(settings_manager: LocalSettingsManager, config: AppConfig) -> None:
+    _section_heading("模型设置", "本机安全凭据")
+    st.caption(
+        "API Key \u4ec5\u4fdd\u5b58\u5728\u5f53\u524d Windows "
+        "\u7528\u6237\u7684 DPAPI \u51ed\u636e\u4e2d\uff0c"
+        "\u4e0d\u5199\u5165 settings.json\u3001SQLite "
+        "\u6216\u9879\u76ee\u6e90\u7801\u3002"
+    )
+    if not config.managed_runtime:
+        st.info("当前由开发环境变量覆盖运行配置；桌面版保存的设置将在移除环境变量后生效。")
+    _render_model_settings_form(settings_manager, config, prefix="settings", first_run=False)
+
+
+def _render_model_settings_form(
+    settings_manager: LocalSettingsManager,
+    config: AppConfig,
+    *,
+    prefix: str,
+    first_run: bool,
+) -> None:
+    saved = (
+        settings_manager.load_model_settings() if config.managed_runtime else config.model_settings
+    )
+    provider_ids = [provider.id for provider in PROVIDERS]
+    initial_provider = saved.provider if saved.provider in provider_ids else "deepseek"
+    provider_id = st.selectbox(
+        "模型服务商",
+        provider_ids,
+        index=provider_ids.index(initial_provider),
+        format_func=lambda item: PROVIDER_BY_ID[item].label,
+        key=f"{prefix}-provider",
+    )
+    definition = PROVIDER_BY_ID[provider_id]
+    custom_model_label = "自定义模型名称…"
+    model_options = [*definition.models, custom_model_label]
+    configured_model = saved.model_name if saved.provider == provider_id else ""
+    initial_model = (
+        configured_model if configured_model in definition.models else custom_model_label
+    )
+    model_choice = st.selectbox(
+        "模型",
+        model_options,
+        index=model_options.index(initial_model),
+        key=f"{prefix}-model-choice-{provider_id}",
+    )
+    if model_choice == custom_model_label:
+        model_name = st.text_input(
+            "自定义模型名称",
+            value=configured_model if configured_model not in definition.models else "",
+            placeholder="例如：my-company-model",
+            key=f"{prefix}-custom-model-{provider_id}",
+        ).strip()
+    else:
+        model_name = model_choice
+
+    custom_endpoint = provider_id == "openai_compatible"
+    configured_url = saved.base_url if saved.provider == provider_id else definition.base_url
+    base_url = st.text_input(
+        "Base URL",
+        value=configured_url or definition.base_url,
+        disabled=not custom_endpoint,
+        placeholder="https://api.example.com/v1",
+        help="常见服务商使用官方地址；自定义 OpenAI Compatible API 可以编辑。",
+        key=f"{prefix}-base-url-{provider_id}",
+    ).strip()
+    saved_provider_has_key = saved.provider == provider_id and bool(config.analyst_api_key)
+    api_key = st.text_input(
+        "API Key",
+        type="password",
+        value="",
+        placeholder=(
+            "已安全保存，留空则保持不变" if saved_provider_has_key else "请输入自己的 API Key"
+        ),
+        help="仅发送给所选模型服务商，Tuoming 不会把它上传到自有服务器。",
+        key=f"{prefix}-api-key-{provider_id}",
+    )
+    candidate = ModelSettings(provider=provider_id, base_url=base_url, model_name=model_name)
+
+    result = st.session_state.get(f"{prefix}-connection-result")
+    if result:
+        renderer = st.success if result["ok"] else st.error
+        renderer(("✓ " if result["ok"] else "") + result["message"])
+
+    test_col, save_col = st.columns([1, 1])
+    if test_col.button(
+        "测试连接",
+        icon=":material/cable:",
+        use_container_width=True,
+        key=f"{prefix}-test",
+    ):
+        stored_key = settings_manager.get_api_key() if saved_provider_has_key else None
+        candidate_key = api_key.strip() or stored_key
+        if not candidate_key:
+            st.session_state[f"{prefix}-connection-result"] = {
+                "ok": False,
+                "message": "请先填写 API Key。",
+            }
+        else:
+            try:
+                with st.spinner("正在验证模型连接"):
+                    provider = create_provider(
+                        candidate, candidate_key, config.network_settings
+                    )
+                    connection = provider.test_connection()
+                st.session_state[f"{prefix}-connection-result"] = {
+                    "ok": connection.ok,
+                    "message": connection.message,
+                }
+            except Exception as exc:
+                st.session_state[f"{prefix}-connection-result"] = {
+                    "ok": False,
+                    "message": str(exc),
+                }
+        st.rerun()
+
+    save_label = "保存并进入工作台" if first_run else "保存设置"
+    if save_col.button(
+        save_label,
+        type="primary",
+        icon=":material/check:",
+        use_container_width=True,
+        key=f"{prefix}-save",
+    ):
+        try:
+            existing_key = settings_manager.get_api_key() if saved_provider_has_key else None
+            if not api_key.strip() and not existing_key:
+                raise ValueError("请填写 API Key 后再保存。")
+            settings_manager.save_model_settings(candidate)
+            if api_key.strip():
+                settings_manager.save_api_key(api_key)
+            st.session_state.pop(f"{prefix}-connection-result", None)
+            _set_flash("success", "模型设置已安全保存。")
+            st.query_params["view"] = "概览"
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
 
 
 def _render_overview(
@@ -295,9 +725,7 @@ def _render_data_view(
         except ValueError as exc:
             st.error(f"{uploaded.name}: {exc}")
             continue
-        file_key = hashlib.sha256(
-            f"{uploaded.name}|{uploaded.size}".encode()
-        ).hexdigest()[:12]
+        file_key = hashlib.sha256(f"{uploaded.name}|{uploaded.size}".encode()).hexdigest()[:12]
         file_policies: dict[str, dict[str, ColumnPolicy]] = {}
         file_retained: dict[str, set[str]] = {}
         with st.expander(
@@ -465,6 +893,8 @@ def _render_analysis_view(
             config.analyst_base_url,
             config.analyst_model_name,
             services.conversations.sanitizer,
+            provider_name=config.analyst_provider,
+            network_settings=config.network_settings,
         )
         workflow = AnalysisWorkflowService(
             services.repository,
@@ -634,9 +1064,7 @@ def _render_workflow_card(
                     preferred_artifact_id=snapshot.run["source_artifact_id"],
                 )
                 with st.spinner("正在生成新版计划"):
-                    workflow.revise(
-                        tenant_id, snapshot.run["id"], safe_feedback, context
-                    )
+                    workflow.revise(tenant_id, snapshot.run["id"], safe_feedback, context)
                 _set_flash("success", "新版计划已生成，请再次确认。")
                 st.rerun()
 
@@ -711,9 +1139,7 @@ def _render_results_view(
         )
         or "脱敏预览"
     )
-    visible = services.artifacts.preview(
-        tenant_id, selected_id, restored=mode == "授权还原"
-    )
+    visible = services.artifacts.preview(tenant_id, selected_id, restored=mode == "授权还原")
     st.dataframe(visible, use_container_width=True, hide_index=True, height=430)
     st.caption("预览最多读取 1,000 行；下载文件仅在选择格式并准备后生成。")
 
@@ -776,9 +1202,7 @@ def _render_export_controls(
         icon=":material/download:",
         use_container_width=True,
     ):
-        _prepare_export(
-            services, tenant_id, artifact, format_name, False, state_key, prepared
-        )
+        _prepare_export(services, tenant_id, artifact, format_name, False, state_key, prepared)
     if restored_col.button(
         "准备还原下载",
         icon=":material/lock_open:",
@@ -786,9 +1210,7 @@ def _render_export_controls(
         help="还原版使用血缘逐块恢复；请选择 CSV 或小型 Excel。",
         use_container_width=True,
     ):
-        _prepare_export(
-            services, tenant_id, artifact, format_name, True, state_key, prepared
-        )
+        _prepare_export(services, tenant_id, artifact, format_name, True, state_key, prepared)
 
     prepared = st.session_state.get(state_key)
     if not prepared:
@@ -821,9 +1243,7 @@ def _prepare_export(
     previous: dict[str, Any] | None,
 ) -> None:
     try:
-        exported = services.artifacts.export(
-            tenant_id, artifact.id, format_name, restored=restored
-        )
+        exported = services.artifacts.export(tenant_id, artifact.id, format_name, restored=restored)
     except (ExportLimitError, ValueError) as exc:
         st.error(str(exc))
         return

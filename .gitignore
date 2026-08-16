@@ -20,3 +20,11 @@ temp_result.csv
 venv/
 .venv/
 
+# Windows desktop packaging outputs
+build/
+dist/
+
+# Local secrets and recovery archives
+*.pfx
+*.p12
+*.tmbak

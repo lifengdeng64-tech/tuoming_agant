@@ -144,6 +144,27 @@ p, label, [data-testid="stCaptionContainer"] { letter-spacing: 0 !important; }
     border-bottom: 1px solid var(--line);
     font-size: .86rem;
 }
+.onboarding-hero {
+    max-width: 920px;
+    margin: 3.2rem auto 2.2rem;
+    display: flex;
+    align-items: center;
+    gap: 1.25rem;
+    padding: 1.7rem 1.8rem;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: linear-gradient(135deg, #ffffff 0%, #edf5ef 100%);
+}
+.onboarding-mark { width: 54px; height: 54px; border-radius: 12px; font-size: 1.35rem; flex: none; }
+.onboarding-hero h1 { margin: .2rem 0 .35rem; font-size: 1.85rem !important; }
+.onboarding-hero p { margin: 0; color: var(--muted); }
+.eyebrow {
+    color: var(--green);
+    font-size: .72rem;
+    font-weight: 750;
+    letter-spacing: .12em !important;
+}
+[data-testid="stTextInput"] input[type="password"] { letter-spacing: .12em !important; }
 @media (max-width: 768px) {
     .block-container { padding: 1.1rem .85rem 5rem; }
     h1 { font-size: 1.42rem !important; }
@@ -152,7 +173,7 @@ p, label, [data-testid="stCaptionContainer"] { letter-spacing: 0 !important; }
     .security-state { margin-top: .2rem; }
     .section-meta { text-align: left; }
     [data-testid="stSegmentedControl"] [role="radiogroup"] { overflow-x: auto; }
+    .onboarding-hero { margin-top: 1rem; align-items: flex-start; padding: 1.2rem; }
 }
 </style>
 """
-

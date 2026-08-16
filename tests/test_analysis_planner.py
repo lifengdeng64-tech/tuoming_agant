@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 
-from tuoming_agent.analysis import planner as planner_module
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.planner import SafeAnalysisPlanner
+from tuoming_agent.providers import factory as provider_factory
 from tuoming_agent.security.dlp import PromptSanitizer
 
 
@@ -36,7 +36,7 @@ def test_deepseek_uses_supported_json_object_output(monkeypatch, services) -> No
         created.append(model)
         return model
 
-    monkeypatch.setattr(planner_module, "ChatOpenAI", fake_chat_openai)
+    monkeypatch.setattr(provider_factory, "ChatOpenAI", fake_chat_openai)
 
     SafeAnalysisPlanner(
         "key",
@@ -58,13 +58,14 @@ def test_non_deepseek_keeps_strict_json_schema_output(monkeypatch, services) -> 
         created.append(model)
         return model
 
-    monkeypatch.setattr(planner_module, "ChatOpenAI", fake_chat_openai)
+    monkeypatch.setattr(provider_factory, "ChatOpenAI", fake_chat_openai)
 
     SafeAnalysisPlanner(
         "key",
         "https://api.openai.com/v1",
         "gpt-5-mini",
         PromptSanitizer(services.vault),
+        provider_name="openai",
     )
 
     assert created[0].structured_calls == [

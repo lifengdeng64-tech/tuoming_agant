@@ -11,6 +11,8 @@ from typing import BinaryIO
 import openpyxl
 import pandas as pd
 
+from tuoming_agent.security.file_scan import scan_upload
+
 
 class UnsupportedFileError(ValueError):
     """Raised for unsupported or unreadable uploads."""
@@ -28,6 +30,7 @@ def iter_file_chunks(
 ) -> Iterator[ParsedTable]:
     if chunk_rows < 1:
         raise ValueError("chunk_rows must be positive.")
+    scan_upload(filename, source)
     suffix = Path(filename).suffix.lower()
     stem = Path(filename).stem.strip() or "dataset"
     if suffix == ".csv":
@@ -69,6 +72,7 @@ def iter_file_chunks(
 
 
 def parse_file(filename: str, content: bytes) -> list[ParsedTable]:
+    scan_upload(filename, BytesIO(content))
     suffix = Path(filename).suffix.lower()
     stem = Path(filename).stem.strip() or "dataset"
     if suffix == ".csv":
@@ -82,6 +86,7 @@ def preview_file(
     filename: str, source: BinaryIO, sample_rows: int = 500
 ) -> list[ParsedTable]:
     """Read only the first rows of each uploaded table for policy selection."""
+    scan_upload(filename, source)
     suffix = Path(filename).suffix.lower()
     stem = Path(filename).stem.strip() or "dataset"
     if suffix == ".csv":

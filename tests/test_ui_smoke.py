@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from streamlit.testing.v1 import AppTest
 
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.config import AppConfig
+from tuoming_agent.security.credentials import WindowsDpapiSecretStore
+from tuoming_agent.settings import MASTER_KEY_CREDENTIAL
 from tuoming_agent.workspace.service import create_services
 
 
@@ -26,6 +30,31 @@ def test_streamlit_workspace_renders_without_runtime_errors(monkeypatch, tmp_pat
         "近期消息",
     ]
 
+
+
+@pytest.mark.skipif(os.name != "nt", reason="desktop onboarding uses Windows DPAPI")
+def test_first_run_initializes_local_security_and_shows_model_setup(
+    monkeypatch, tmp_path: Path
+) -> None:
+    app_dir = tmp_path / "desktop-profile"
+    monkeypatch.delenv("MASKING_MASTER_KEY", raising=False)
+    monkeypatch.delenv("ANALYST_API_KEY", raising=False)
+    monkeypatch.setenv("TUOMING_APP_DIR", str(app_dir))
+    monkeypatch.setenv("TUOMING_DATA_DIR", str(app_dir / "data"))
+    monkeypatch.setenv("TUOMING_DESKTOP", "1")
+
+    app = AppTest.from_file(Path(__file__).parents[1] / "app.py")
+    app.run(timeout=30)
+
+    assert not app.exception
+    assert "模型服务商" in [item.label for item in app.selectbox]
+    assert "API Key" in [item.label for item in app.text_input]
+    assert "测试连接" in [item.label for item in app.button]
+    assert "保存并进入工作台" in [item.label for item in app.button]
+    secret_store = WindowsDpapiSecretStore(app_dir / "credentials")
+    assert len(secret_store.get(MASTER_KEY_CREDENTIAL) or b"") == 32
+    settings_text = (app_dir / "settings.json").read_text(encoding="utf-8")
+    assert "masking-master-key" not in settings_text
 
 def test_results_page_uses_bounded_preview_without_eager_full_load(monkeypatch, tmp_path: Path):
     encoded_key = base64.urlsafe_b64encode(b"k" * 32).decode("ascii")

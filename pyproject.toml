@@ -4,13 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tuoming-agent"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local-first, privacy-preserving data analysis workspace"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=43.0",
     "duckdb>=1.4,<1.6",
+    "httpx>=0.27,<1",
+    "langchain-anthropic>=0.3,<1",
+    "langchain-google-genai>=2,<3",
     "langchain-openai>=0.2.14,<1",
     "openpyxl>=3.1",
     "pandas>=2.2",
@@ -26,9 +29,15 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.3",
 ]
+desktop = [
+    "pillow>=10.4",
+    "pyinstaller>=6.10",
+    "pystray>=0.19.5",
+]
 
 [project.scripts]
 tuoming-keygen = "tuoming_agent.keygen:main"
+tuoming-agent = "tuoming_agent.desktop.launcher:main"
 
 [tool.setuptools.packages.find]
 include = ["tuoming_agent*"]

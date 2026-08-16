@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 from typing import Any
-from urllib.parse import urlparse
-
-from langchain_openai import ChatOpenAI
 
 from tuoming_agent.analysis.models import AnalysisPlan
+from tuoming_agent.providers import AnalysisModelProvider, create_provider
 from tuoming_agent.security.dlp import PromptSanitizer
+from tuoming_agent.settings import PROVIDER_BY_ID, ModelSettings, NetworkSettings
 
 PLANNER_SYSTEM_PROMPT = """You are a data-operation planner.
 Return only valid JSON matching AnalysisPlan.
@@ -31,20 +30,22 @@ class SafeAnalysisPlanner:
         model_name: str,
         sanitizer: PromptSanitizer,
         model: Any | None = None,
+        *,
+        provider_name: str = "deepseek",
+        provider: AnalysisModelProvider | None = None,
+        network_settings: NetworkSettings | None = None,
     ):
         if model is None:
             if not api_key:
                 raise ValueError("An analyst API key is required for natural-language planning.")
-            chat_model = ChatOpenAI(
-                api_key=api_key,
-                base_url=base_url,
-                model=model_name,
-                temperature=0,
+            definition = PROVIDER_BY_ID.get(provider_name, PROVIDER_BY_ID["openai_compatible"])
+            settings = ModelSettings(
+                provider=definition.id,
+                base_url=base_url or definition.base_url,
+                model_name=model_name,
             )
-            model = chat_model.with_structured_output(
-                AnalysisPlan,
-                method=_structured_output_method(base_url),
-            )
+            provider = provider or create_provider(settings, api_key, network_settings)
+            model = provider.structured_model(AnalysisPlan)
         self.model = model
         self.sanitizer = sanitizer
 
@@ -68,10 +69,3 @@ class SafeAnalysisPlanner:
         plan = result if isinstance(result, AnalysisPlan) else AnalysisPlan.model_validate(result)
         self.sanitizer.assert_safe(f"{plan.result_name}\n{plan.safe_summary}")
         return plan
-
-
-def _structured_output_method(base_url: str | None) -> str:
-    hostname = (urlparse(base_url).hostname or "").casefold() if base_url else ""
-    if hostname == "deepseek.com" or hostname.endswith(".deepseek.com"):
-        return "json_mode"
-    return "json_schema"
