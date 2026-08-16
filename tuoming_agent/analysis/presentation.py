@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from tuoming_agent.analysis.models import AnalysisPlan
@@ -22,12 +23,13 @@ def _quoted(values: list[str]) -> str:
     return "、".join(f"“{value}”" for value in values)
 
 
-def _describe(operation: Any) -> str:
+def _describe(operation: Any, resolve_value: Callable[[Any], Any] | None = None) -> str:
     action = operation.action
     if action == "select":
         return f"保留列：{_quoted(operation.columns)}"
     if action == "filter":
-        suffix = "" if operation.operator in {"notnull", "isnull"} else f" {operation.value!r}"
+        value = resolve_value(operation.value) if resolve_value else operation.value
+        suffix = "" if operation.operator in {"notnull", "isnull"} else f" {value!r}"
         return f"筛选“{operation.column}”：{OPERATORS[operation.operator]}{suffix}"
     if action == "sort":
         direction = "升序" if operation.ascending is True else "降序"
@@ -37,7 +39,13 @@ def _describe(operation: Any) -> str:
     if action == "cast":
         return "转换类型：" + "、".join(f"“{a}”→{b}" for a, b in operation.mapping.items())
     if action == "fillna":
-        return f"填充空值：{_quoted(list(operation.values))}"
+        values = {
+            column: resolve_value(value) if resolve_value else value
+            for column, value in operation.values.items()
+        }
+        return "填充空值：" + "、".join(
+            f"“{column}”填充为 {value!r}" for column, value in values.items()
+        )
     if action == "dropna":
         return f"删除空值行：{_quoted(operation.subset or []) or '全部列'}"
     if action == "deduplicate":
@@ -56,12 +64,14 @@ def _describe(operation: Any) -> str:
     return f"执行白名单操作：{action}"
 
 
-def describe_plan(plan: AnalysisPlan) -> list[str]:
+def describe_plan(
+    plan: AnalysisPlan, resolve_value: Callable[[Any], Any] | None = None
+) -> list[str]:
     return [
         f"数据源：{plan.input_artifact_id}",
         f"结果名称：{plan.result_name}",
         *[
-            f"步骤 {index}：{_describe(operation)}"
+            f"步骤 {index}：{_describe(operation, resolve_value)}"
             for index, operation in enumerate(plan.operations, 1)
         ],
     ]

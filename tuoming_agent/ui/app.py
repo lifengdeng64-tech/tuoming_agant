@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from tuoming_agent import __version__
+from tuoming_agent.analysis.naming import GeneratedNameValidationError
 from tuoming_agent.analysis.planner import SafeAnalysisPlanner
 from tuoming_agent.analysis.presentation import describe_plan
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService, WorkflowSnapshot
@@ -35,7 +36,9 @@ from tuoming_agent.settings import (
     NetworkSettings,
     default_app_dir,
 )
+from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
 from tuoming_agent.ui.styles import APP_STYLES
+from tuoming_agent.workspace.data_sources import DataSourceDeletionError
 from tuoming_agent.workspace.service import ApplicationServices, create_services
 
 VIEW_OPTIONS = ("概览", "数据", "分析", "结果", "设置")
@@ -773,7 +776,7 @@ def _render_data_view(
         prepared.append((uploaded.name, uploaded, file_policies, file_retained))
 
     if prepared and st.button(
-        f"确认并追加 {len(prepared)} 个文件",
+        "确认添加",
         type="primary",
         icon=":material/upload_file:",
         use_container_width=False,
@@ -807,6 +810,7 @@ def _render_data_view(
                     {
                         "数据集": item["logical_name"],
                         "版本": f"V{item['version']}",
+                        "行数": item["row_count"],
                         "制品 ID": str(item["artifact_id"])[:8],
                         "更新时间": _format_timestamp(item["version_created_at"]),
                     }
@@ -814,6 +818,27 @@ def _render_data_view(
                 ]
             )
             st.dataframe(dataset_table, use_container_width=True, hide_index=True)
+            for dataset in datasets:
+                action_col, delete_col = st.columns([4, 1], vertical_alignment="center")
+                action_col.caption(
+                    f"{dataset['logical_name']} · V{dataset['version']} · "
+                    f"{dataset['row_count']:,} 行"
+                )
+                if delete_col.button(
+                    "删除工作表",
+                    key=(
+                        f"delete-table-{workspace_id}-"
+                        f"{dataset['dataset_version_id']}"
+                    ),
+                    use_container_width=True,
+                ):
+                    st.session_state[f"pending-table-delete-{workspace_id}"] = dataset[
+                        "dataset_version_id"
+                    ]
+                    st.rerun()
+                _render_dataset_version_deletion(
+                    services, tenant_id, workspace_id, dataset
+                )
         else:
             _empty_state("暂无数据集", "数据")
     with file_col:
@@ -831,8 +856,153 @@ def _render_data_view(
                 ]
             )
             st.dataframe(file_table, use_container_width=True, hide_index=True)
+            for file_record in files:
+                action_col, delete_col = st.columns([4, 1], vertical_alignment="center")
+                action_col.caption(
+                    f"{file_record['original_name']} · {file_record['sha256'][:10]}"
+                )
+                if delete_col.button(
+                    "删除",
+                    key=f"delete-file-{workspace_id}-{file_record['id']}",
+                    use_container_width=True,
+                ):
+                    st.session_state[f"pending-delete-{workspace_id}"] = file_record["id"]
+                    st.rerun()
+                _render_file_deletion(
+                    services, tenant_id, workspace_id, file_record
+                )
         else:
             _empty_state("暂无上传记录", "文件")
+
+
+def _render_dataset_version_deletion(
+    services: Any,
+    tenant_id: str,
+    workspace_id: str,
+    dataset: dict[str, Any],
+) -> None:
+    state_key = f"pending-table-delete-{workspace_id}"
+    dataset_version_id = dataset["dataset_version_id"]
+    if st.session_state.get(state_key) != dataset_version_id:
+        return
+    try:
+        impact = services.data_sources.inspect_table(
+            tenant_id, workspace_id, dataset_version_id
+        )
+    except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
+        st.warning(f"无法检查工作表删除影响：{exc}")
+        return
+
+    has_dependencies = (
+        impact.analysis_run_count > 0
+        or impact.artifact_count > 1
+        or impact.message_count > 0
+    )
+    st.warning(
+        f"将删除工作表 {impact.logical_name} V{impact.version}（{impact.row_count:,} 行）、"
+        f"{impact.artifact_count} 个本地制品和 "
+        f"{impact.analysis_run_count} 个关联分析、关联对话 {impact.message_count} 条。"
+    )
+    acknowledged = True
+    if has_dependencies:
+        acknowledged = st.checkbox(
+            "我了解关联分析和结果也会删除",
+            key=f"ack-table-delete-{workspace_id}-{dataset_version_id}",
+        )
+    st.caption("加密原文件和同一文件的其他工作表会保留；该操作不能撤销。")
+    if st.button(
+        "确认删除工作表",
+        key=f"confirm-table-delete-{workspace_id}-{dataset_version_id}",
+        type="primary",
+        disabled=not acknowledged,
+    ):
+        try:
+            deleted = services.data_sources.delete_table(
+                tenant_id, workspace_id, dataset_version_id
+            )
+        except (
+            AuthorizationError,
+            DataSourceDeletionError,
+            RecordNotFoundError,
+            ValueError,
+            OSError,
+        ) as exc:
+            st.warning(f"删除失败，原数据已保留：{exc}")
+            return
+        st.session_state.pop(state_key, None)
+        _set_flash(
+            "success",
+            f"已删除工作表 {deleted.logical_name} 及 "
+            f"{deleted.artifact_count - 1} 个关联制品。",
+        )
+        st.rerun()
+    if st.button(
+        "取消",
+        key=f"cancel-table-delete-{workspace_id}-{dataset_version_id}",
+    ):
+        st.session_state.pop(state_key, None)
+        st.rerun()
+
+
+def _render_file_deletion(
+    services: Any,
+    tenant_id: str,
+    workspace_id: str,
+    file_record: dict[str, Any],
+) -> None:
+    state_key = f"pending-delete-{workspace_id}"
+    if st.session_state.get(state_key) != file_record["id"]:
+        return
+    try:
+        impact = services.data_sources.inspect(
+            tenant_id, workspace_id, file_record["id"]
+        )
+    except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
+        st.warning(f"无法检查删除影响：{exc}")
+        return
+
+    has_dependencies = (
+        impact.analysis_run_count > 0
+        or impact.artifact_count > 1
+        or impact.message_count > 0
+    )
+    st.warning(
+        f"将删除 {impact.dataset_version_count} 个数据版本、"
+        f"{impact.artifact_count} 个本地制品和 "
+        f"{impact.analysis_run_count} 个关联分析、关联对话 {impact.message_count} 条。"
+    )
+    acknowledged = True
+    if has_dependencies:
+        acknowledged = st.checkbox(
+            "我了解关联内容也会删除",
+            key=f"ack-delete-{workspace_id}-{file_record['id']}",
+        )
+    st.caption("该操作会删除本地加密原件和关联制品，且不能撤销。")
+    if st.button(
+        "确认删除",
+        key=f"confirm-delete-{workspace_id}-{file_record['id']}",
+        type="primary",
+        disabled=not acknowledged,
+    ):
+        try:
+            deleted = services.data_sources.delete(
+                tenant_id, workspace_id, file_record["id"]
+            )
+        except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
+            st.warning(f"删除失败，原数据已保留：{exc}")
+            return
+        st.session_state.pop(state_key, None)
+        _set_flash(
+            "success",
+            f"已删除 {deleted.original_name} 及 {deleted.artifact_count} 个关联制品。",
+        )
+        st.rerun()
+    if st.button(
+        "取消",
+        key=f"cancel-delete-{workspace_id}-{file_record['id']}",
+    ):
+        st.session_state.pop(state_key, None)
+        st.rerun()
 
 
 def _render_analysis_view(
@@ -919,7 +1089,7 @@ def _render_analysis_view(
     with st.chat_message("user"):
         st.markdown(prompt)
     try:
-        safe_request = services.conversations.add_user_message(tenant_id, conversation_id, prompt)
+        request = services.conversations.add_user_message(tenant_id, conversation_id, prompt)
         context = services.conversations.build_safe_context(
             tenant_id,
             workspace_id,
@@ -934,14 +1104,17 @@ def _render_analysis_view(
                 workspace_id,
                 conversation_id,
                 source_id,
-                safe_request,
+                request.safe_content,
                 context,
+                request_message_id=request.id,
             )
         if created.run["status"] == "awaiting_confirmation":
             _set_flash("success", "计划已生成，请预览并确认后再执行。")
         elif created.run["status"] == "security_blocked":
             _set_flash("error", "计划触发安全拒绝，已阻止且不会自动修复。")
         st.rerun()
+    except GeneratedNameValidationError as exc:
+        st.error(str(exc))
     except (SensitiveContentError, ValueError) as exc:
         st.error(str(exc))
     except Exception:
@@ -986,7 +1159,12 @@ def _render_workflow_card(
         )
 
         if snapshot.plan_versions:
-            for line in describe_plan(snapshot.current_plan.plan):
+            for line in describe_plan(
+                snapshot.current_plan.plan,
+                resolve_value=lambda value: services.masking.restore_display_value(
+                    tenant_id, value
+                ),
+            ):
                 st.markdown(f"- {line}")
             if snapshot.current_plan.reason == "repair" and snapshot.run["error_message"]:
                 st.warning(f"上次执行未通过：{snapshot.run['error_message']}")
@@ -1029,6 +1207,7 @@ def _render_workflow_card(
                         conversation_id,
                         result.current_plan.plan.safe_summary,
                         artifact_id,
+                        analysis_run_id=result.run["id"],
                     )
                     st.session_state[f"result-selected-{workspace_id}"] = artifact_id
                     _set_flash("success", f"分析完成，已生成制品 {artifact_id[:8]}。")
@@ -1054,19 +1233,29 @@ def _render_workflow_card(
                 )
                 submitted = st.form_submit_button("根据意见生成新版计划")
             if submitted and feedback.strip():
-                safe_feedback = services.conversations.sanitizer.sanitize(
-                    tenant_id, feedback.strip()
-                )
-                context = services.conversations.build_safe_context(
-                    tenant_id,
-                    workspace_id,
-                    conversation_id,
-                    preferred_artifact_id=snapshot.run["source_artifact_id"],
-                )
-                with st.spinner("正在生成新版计划"):
-                    workflow.revise(tenant_id, snapshot.run["id"], safe_feedback, context)
-                _set_flash("success", "新版计划已生成，请再次确认。")
-                st.rerun()
+                try:
+                    safe_feedback = services.conversations.sanitizer.sanitize(
+                        tenant_id, feedback.strip()
+                    )
+                    context = services.conversations.build_safe_context(
+                        tenant_id,
+                        workspace_id,
+                        conversation_id,
+                        preferred_artifact_id=snapshot.run["source_artifact_id"],
+                    )
+                    with st.spinner("正在生成新版计划"):
+                        workflow.revise(
+                            tenant_id, snapshot.run["id"], safe_feedback, context
+                        )
+                except (
+                    GeneratedNameValidationError,
+                    SensitiveContentError,
+                    ValueError,
+                ) as exc:
+                    st.error(str(exc))
+                else:
+                    _set_flash("success", "新版计划已生成，请再次确认。")
+                    st.rerun()
 
         elif status == "completed":
             st.success(f"质量校验通过，制品 {snapshot.run['result_artifact_id'][:8]} 已保存。")

@@ -11,12 +11,13 @@ import pyarrow.parquet as pq
 from tuoming_agent.config import AppConfig
 from tuoming_agent.exporting import ExportedFile, prepare_export
 from tuoming_agent.ingestion.service import IngestionService
-from tuoming_agent.models import ArtifactRecord, ColumnLineage, utc_now
+from tuoming_agent.models import ArtifactRecord, ColumnLineage, MessageRecord, utc_now
 from tuoming_agent.security.dlp import PromptSanitizer
 from tuoming_agent.security.masking import MaskingService
 from tuoming_agent.security.vault import TokenVault
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
 from tuoming_agent.storage.sqlite import SQLiteRepository
+from tuoming_agent.workspace.data_sources import DataSourceService
 
 
 class ArtifactService:
@@ -192,11 +193,15 @@ class ConversationService:
         self.repository = repository
         self.sanitizer = sanitizer
 
-    def add_user_message(self, tenant_id: str, conversation_id: str, raw_content: str) -> str:
+    def add_user_message(
+        self, tenant_id: str, conversation_id: str, raw_content: str
+    ) -> MessageRecord:
         safe_content = self.sanitizer.sanitize(tenant_id, raw_content)
-        self.repository.add_message(tenant_id, conversation_id, "user", safe_content=safe_content)
+        message = self.repository.add_message(
+            tenant_id, conversation_id, "user", safe_content=safe_content
+        )
         self._roll_up_summary(tenant_id, conversation_id)
-        return safe_content
+        return message
 
     def add_assistant_message(
         self,
@@ -204,6 +209,7 @@ class ConversationService:
         conversation_id: str,
         safe_content: str,
         artifact_id: str | None = None,
+        analysis_run_id: str | None = None,
     ) -> None:
         self.sanitizer.assert_safe(safe_content)
         self.repository.add_message(
@@ -212,6 +218,7 @@ class ConversationService:
             "assistant",
             safe_content=safe_content,
             artifact_id=artifact_id,
+            analysis_run_id=analysis_run_id,
         )
         self._roll_up_summary(tenant_id, conversation_id)
 
@@ -275,6 +282,7 @@ class ApplicationServices:
     ingestion: IngestionService
     artifacts: ArtifactService
     conversations: ConversationService
+    data_sources: DataSourceService
 
 
 def create_services(config: AppConfig) -> ApplicationServices:
@@ -299,4 +307,5 @@ def create_services(config: AppConfig) -> ApplicationServices:
         ),
         artifacts=artifacts,
         conversations=ConversationService(repository, sanitizer),
+        data_sources=DataSourceService(repository, config.data_dir),
     )

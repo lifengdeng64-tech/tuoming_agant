@@ -62,7 +62,7 @@ class MergeOperation(StrictModel):
     how: Literal["inner", "left", "right", "outer"] = "inner"
     left_on: list[str] = Field(min_length=1)
     right_on: list[str] = Field(min_length=1)
-    suffixes: tuple[str, str] = ("_left", "_right")
+    suffixes: tuple[str, str] = ("_左表", "_右表")
 
 
 class Aggregation(StrictModel):

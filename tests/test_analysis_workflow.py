@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from tuoming_agent.analysis.executor import AnalysisResourceError
 from tuoming_agent.analysis.models import AnalysisPlan
+from tuoming_agent.analysis.naming import GeneratedNameValidationError
+from tuoming_agent.analysis.planner import SafeAnalysisPlanner
 from tuoming_agent.analysis.quality import QualityIssue, QualityReport
 from tuoming_agent.analysis.workflow import AnalysisWorkflowService
+from tuoming_agent.security.dlp import PromptSanitizer, SensitiveContentError
+from tuoming_agent.storage.errors import AuthorizationError
 
 
 class QueuePlanner:
@@ -13,9 +18,21 @@ class QueuePlanner:
         self.plans = list(plans)
         self.calls: list[tuple[str, dict]] = []
 
-    def create_plan(self, safe_request: str, safe_context: dict) -> AnalysisPlan:
+    def create_plan(
+        self, safe_request: str, safe_context: dict, _tenant_id: str
+    ) -> AnalysisPlan:
         self.calls.append((safe_request, safe_context))
         return self.plans.pop(0)
+
+
+class SequencePlanModel:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def invoke(self, messages):
+        self.calls.append(messages)
+        return self.responses.pop(0)
 
 
 def _source(services, workspace):
@@ -59,6 +76,259 @@ def test_plan_requires_confirmation_and_survives_repository_reopen(services, wor
     reopened = AnalysisWorkflowService(services.repository, services.artifacts, planner)
     restored = reopened.get_snapshot("tenant-a", snapshot.run["id"])
     assert restored.current_plan.plan == _plan(source.id)
+
+
+def test_request_message_links_an_analysis_run_and_response(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    workflow = AnalysisWorkflowService(
+        services.repository, services.artifacts, QueuePlanner([_plan(source.id)])
+    )
+    request = services.conversations.add_user_message(
+        "tenant-a", conversation["id"], "汇总营收"
+    )
+
+    started = workflow.start(
+        "tenant-a",
+        workspace.id,
+        conversation["id"],
+        source.id,
+        request.safe_content,
+        {},
+        request_message_id=request.id,
+    )
+    services.conversations.add_assistant_message(
+        "tenant-a",
+        conversation["id"],
+        "处理完成",
+        analysis_run_id=started.run["id"],
+    )
+
+    links = services.repository.list_analysis_run_messages("tenant-a", started.run["id"])
+
+    assert [item["kind"] for item in links] == ["request", "response"]
+
+
+def test_invalid_generated_names_never_persist_a_plan_version(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    invalid = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="revenue report",
+        operations=[{"action": "head", "rows": 5}],
+    )
+    planner = SafeAnalysisPlanner(
+        None,
+        None,
+        "test",
+        PromptSanitizer(services.vault),
+        model=SequencePlanModel([invalid, invalid]),
+    )
+    workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
+
+    with pytest.raises(GeneratedNameValidationError):
+        workflow.start(
+            "tenant-a",
+            workspace.id,
+            conversation["id"],
+            source.id,
+            "汇总营收",
+            {},
+        )
+
+    run = services.repository.list_analysis_runs(
+        "tenant-a", workspace.id, conversation["id"]
+    )[0]
+    assert run["status"] == "failed"
+    assert services.repository.list_analysis_plan_versions("tenant-a", run["id"]) == []
+
+
+def test_initial_plan_rejects_generated_name_pii_before_persistence(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    unsafe = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="营收分析",
+        operations=[
+            {
+                "action": "derive",
+                "column": "手机号13800138000",
+                "expression": "col('sales')",
+            }
+        ],
+    )
+    model = SequencePlanModel([unsafe])
+    planner = SafeAnalysisPlanner(
+        None,
+        None,
+        "test",
+        PromptSanitizer(services.vault),
+        model=model,
+    )
+    workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
+
+    with pytest.raises(SensitiveContentError):
+        workflow.start(
+            "tenant-a",
+            workspace.id,
+            conversation["id"],
+            source.id,
+            "生成手机号字段",
+            {},
+        )
+
+    run = services.repository.list_analysis_runs(
+        "tenant-a", workspace.id, conversation["id"]
+    )[0]
+    assert services.repository.list_analysis_plan_versions("tenant-a", run["id"]) == []
+    assert len(model.calls) == 1
+
+
+def test_source_column_pii_reference_and_tokenized_value_are_preserved(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    token = services.vault.tokenize("tenant-a", "phone", "13800138000", "phone")
+    plan = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="筛选结果",
+        operations=[
+            {
+                "action": "filter",
+                "column": "手机号13800138000",
+                "operator": "eq",
+                "value": token,
+            }
+        ],
+    )
+    planner = SafeAnalysisPlanner(
+        None,
+        None,
+        "test",
+        PromptSanitizer(services.vault),
+        model=SequencePlanModel([plan]),
+    )
+    workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
+
+    started = workflow.start(
+        "tenant-a", workspace.id, conversation["id"], source.id, "筛选手机号", {}
+    )
+
+    operation = started.current_plan.plan.operations[0]
+    assert operation.column == "手机号13800138000"
+    assert operation.value == token
+
+
+def test_revision_rejects_known_plaintext_filter_value_before_persistence(
+    services, workspace
+):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    services.vault.tokenize("tenant-a", "brand", "华住")
+    initial = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="营收分析",
+        operations=[{"action": "head", "rows": 5}],
+    )
+    unsafe_revision = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="品牌营收",
+        operations=[
+            {"action": "filter", "column": "store", "operator": "eq", "value": "华住"}
+        ],
+    )
+    model = SequencePlanModel([initial, unsafe_revision])
+    planner = SafeAnalysisPlanner(
+        None,
+        None,
+        "test",
+        PromptSanitizer(services.vault),
+        model=model,
+    )
+    workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
+    started = workflow.start(
+        "tenant-a", workspace.id, conversation["id"], source.id, "汇总营收", {}
+    )
+
+    with pytest.raises(SensitiveContentError):
+        workflow.revise("tenant-a", started.run["id"], "只看华住", {})
+
+    versions = services.repository.list_analysis_plan_versions(
+        "tenant-a", started.run["id"]
+    )
+    assert len(versions) == 1
+    assert versions[0]["decision"] == "pending"
+    assert len(model.calls) == 2
+
+
+def test_repair_rejects_known_plaintext_fill_value_before_persistence(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    services.vault.tokenize("tenant-a", "brand", "华住")
+    failing = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="营收分析",
+        operations=[{"action": "select", "columns": ["missing"]}],
+    )
+    unsafe_repair = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="修复结果",
+        operations=[{"action": "fillna", "values": {"store": "华住"}}],
+    )
+    model = SequencePlanModel([failing, unsafe_repair])
+    planner = SafeAnalysisPlanner(
+        None,
+        None,
+        "test",
+        PromptSanitizer(services.vault),
+        model=model,
+    )
+    workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
+    started = workflow.start(
+        "tenant-a", workspace.id, conversation["id"], source.id, "汇总营收", {}
+    )
+
+    repaired = workflow.confirm("tenant-a", started.run["id"])
+
+    assert repaired.run["status"] == "failed"
+    assert len(repaired.plan_versions) == 1
+    assert len(model.calls) == 2
+
+
+def test_analysis_run_message_links_reject_other_conversation_and_tenant(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    other_conversation = _conversation(services, workspace)
+    workflow = AnalysisWorkflowService(
+        services.repository, services.artifacts, QueuePlanner([_plan(source.id)])
+    )
+    other_request = services.conversations.add_user_message(
+        "tenant-a", other_conversation["id"], "汇总营收"
+    )
+
+    with pytest.raises(AuthorizationError, match="conversation"):
+        workflow.start(
+            "tenant-a",
+            workspace.id,
+            conversation["id"],
+            source.id,
+            other_request.safe_content,
+            {},
+            request_message_id=other_request.id,
+        )
+
+    started = workflow.start(
+        "tenant-a", workspace.id, conversation["id"], source.id, "汇总营收", {}
+    )
+    other_workspace = services.repository.create_workspace("tenant-b", "其他工作区")
+    tenant_b_conversation = services.repository.create_conversation("tenant-b", other_workspace.id)
+
+    with pytest.raises(AuthorizationError):
+        services.conversations.add_assistant_message(
+            "tenant-b",
+            tenant_b_conversation["id"],
+            "处理完成",
+            analysis_run_id=started.run["id"],
+        )
 
 
 def test_confirm_executes_validates_and_persists_result(services, workspace):

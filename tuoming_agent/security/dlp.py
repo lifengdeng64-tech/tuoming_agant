@@ -16,6 +16,13 @@ PII_PATTERNS = {
 }
 
 
+def _known_value_pattern(value: str) -> re.Pattern[str] | None:
+    parts = [part for part in re.split(r"\s+", value.strip()) if part]
+    if len("".join(parts)) < 2:
+        return None
+    return re.compile(r"\s+".join(re.escape(part) for part in parts), re.IGNORECASE)
+
+
 class PromptSanitizer:
     def __init__(self, vault: TokenVault):
         self.vault = vault
@@ -26,16 +33,22 @@ class PromptSanitizer:
             self.vault.iter_plaintext_tokens(tenant_id), key=lambda item: len(item[0]), reverse=True
         )
         for plaintext, token in known_values:
-            parts = [re.escape(part) for part in re.split(r"\s+", plaintext.strip()) if part]
-            if parts:
-                safe_text = re.sub(
-                    r"\s+".join(parts),
+            pattern = _known_value_pattern(plaintext)
+            if pattern is not None:
+                safe_text = pattern.sub(
                     lambda _match, replacement=token: replacement,
                     safe_text,
-                    flags=re.IGNORECASE,
                 )
         self.assert_safe(safe_text, forbidden_values=[value for value, _ in known_values])
         return safe_text
+
+    def assert_tenant_safe(self, tenant_id: str, text: str) -> None:
+        self.assert_safe(
+            text,
+            forbidden_values=[
+                plaintext for plaintext, _token in self.vault.iter_plaintext_tokens(tenant_id)
+            ],
+        )
 
     @staticmethod
     def assert_safe(text: str, forbidden_values: list[str] | None = None) -> None:
@@ -45,8 +58,8 @@ class PromptSanitizer:
                     f"Outbound content contains suspected {category}; request was blocked locally."
                 )
         for value in forbidden_values or []:
-            if len(value) >= 2 and value in text:
+            pattern = _known_value_pattern(value)
+            if pattern is not None and pattern.search(text):
                 raise SensitiveContentError(
                     "Outbound content still contains a known plaintext mapping value."
                 )
-

@@ -28,3 +28,6 @@ dist/
 *.pfx
 *.p12
 *.tmbak
+
+# Isolated feature worktrees
+.worktrees/

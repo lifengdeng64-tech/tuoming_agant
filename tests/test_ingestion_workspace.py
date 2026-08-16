@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from io import BytesIO
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -79,6 +80,135 @@ def test_duplicate_file_is_detected_by_content_hash(services, workspace):
     assert duplicate.artifacts[0].id == first.artifacts[0].id
 
 
+def test_reupload_restores_only_a_deleted_worksheet(services, workspace):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame({"value": [1]}).to_excel(writer, sheet_name="Sheet1", index=False)
+        pd.DataFrame({"value": [2, 3]}).to_excel(writer, sheet_name="page", index=False)
+    payload = buffer.getvalue()
+    policies = {"sales::Sheet1": {}, "sales::page": {}}
+    original = services.ingestion.ingest(
+        "tenant-a", workspace.id, "sales.xlsx", BytesIO(payload), policies
+    )
+    versions = services.repository.get_file_versions("tenant-a", original.file_id)
+    page_version_id = next(
+        row["id"] for row in versions if row["logical_name"] == "sales::page"
+    )
+    sheet1_artifact_id = next(
+        row["artifact_id"]
+        for row in versions
+        if row["logical_name"] == "sales::Sheet1"
+    )
+    file_record = services.repository.find_file_by_hash(
+        "tenant-a", workspace.id, original.content_hash
+    )
+    encrypted_path = Path(file_record["encrypted_path"])
+    encrypted_before = encrypted_path.read_bytes()
+    services.data_sources.delete_table("tenant-a", workspace.id, page_version_id)
+
+    restored = services.ingestion.ingest(
+        "tenant-a", workspace.id, "sales.xlsx", BytesIO(payload), policies
+    )
+    restored_versions = services.repository.get_file_versions(
+        "tenant-a", original.file_id
+    )
+
+    assert restored.file_id == original.file_id
+    assert restored.duplicate is False
+    assert {row["logical_name"] for row in restored_versions} == {
+        "sales::Sheet1",
+        "sales::page",
+    }
+    assert sum(
+        row["logical_name"] == "sales::Sheet1" for row in restored_versions
+    ) == 1
+    assert next(
+        row["artifact_id"]
+        for row in restored_versions
+        if row["logical_name"] == "sales::Sheet1"
+    ) == sheet1_artifact_id
+    assert encrypted_path.read_bytes() == encrypted_before
+
+
+def test_reupload_complete_workbook_is_a_duplicate_without_new_artifacts(
+    services, workspace
+):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame({"value": [1]}).to_excel(writer, sheet_name="Sheet1", index=False)
+        pd.DataFrame({"value": [2]}).to_excel(writer, sheet_name="page", index=False)
+    payload = buffer.getvalue()
+    policies = {"sales::Sheet1": {}, "sales::page": {}}
+    first = services.ingestion.ingest(
+        "tenant-a", workspace.id, "sales.xlsx", BytesIO(payload), policies
+    )
+    artifact_ids_before = {
+        artifact.id
+        for artifact in services.repository.list_artifacts("tenant-a", workspace.id)
+    }
+
+    duplicate = services.ingestion.ingest(
+        "tenant-a", workspace.id, "sales.xlsx", BytesIO(payload), policies
+    )
+
+    assert duplicate.file_id == first.file_id
+    assert duplicate.duplicate is True
+    assert {
+        artifact.id
+        for artifact in services.repository.list_artifacts("tenant-a", workspace.id)
+    } == artifact_ids_before
+
+
+def test_reupload_rejects_stream_changed_before_restored_sheet_publication(
+    monkeypatch, services, workspace
+):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame({"value": [1]}).to_excel(writer, sheet_name="Sheet1", index=False)
+        pd.DataFrame({"value": [2]}).to_excel(writer, sheet_name="page", index=False)
+    payload = buffer.getvalue()
+    policies = {"sales::Sheet1": {}, "sales::page": {}}
+    original = services.ingestion.ingest(
+        "tenant-a", workspace.id, "sales.xlsx", BytesIO(payload), policies
+    )
+    versions = services.repository.get_file_versions("tenant-a", original.file_id)
+    page_version_id = next(
+        row["id"] for row in versions if row["logical_name"] == "sales::page"
+    )
+    services.data_sources.delete_table("tenant-a", workspace.id, page_version_id)
+    artifacts_before = {
+        artifact.id
+        for artifact in services.repository.list_artifacts("tenant-a", workspace.id)
+    }
+    source = BytesIO(payload)
+    original_write = services.ingestion.artifact_store.write_chunks
+
+    def mutate_after_write(*args, **kwargs):
+        path = original_write(*args, **kwargs)
+        source.seek(0)
+        source.write(b"x" * len(payload))
+        source.truncate()
+        return path
+
+    monkeypatch.setattr(
+        services.ingestion.artifact_store, "write_chunks", mutate_after_write
+    )
+
+    with pytest.raises(ValueError, match="changed while it was being ingested"):
+        services.ingestion.ingest(
+            "tenant-a", workspace.id, "sales.xlsx", source, policies
+        )
+
+    remaining_versions = services.repository.get_file_versions(
+        "tenant-a", original.file_id
+    )
+    assert {row["logical_name"] for row in remaining_versions} == {"sales::Sheet1"}
+    assert {
+        artifact.id
+        for artifact in services.repository.list_artifacts("tenant-a", workspace.id)
+    } == artifacts_before
+
+
 def test_excel_all_sheets_and_same_name_versions(services, workspace):
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -93,6 +223,34 @@ def test_excel_all_sheets_and_same_name_versions(services, workspace):
     )
     assert len(result.artifacts) == 2
     assert {item.name for item in result.artifacts} == {"book::门店", "book::客户"}
+
+
+def test_excel_ingestion_keeps_numeric_nulls_and_does_not_tokenize_them(
+    services, workspace
+):
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(
+            {
+                "营收完成度": [0.8, "NaN", None, 0.0],
+                "客户": ["Alice", "NaN", None, "Bob"],
+            }
+        ).to_excel(writer, sheet_name="page", index=False)
+
+    result = services.ingestion.ingest(
+        "tenant-a",
+        workspace.id,
+        "completion.xlsx",
+        BytesIO(buffer.getvalue()),
+        {"completion::page": {"客户": ColumnPolicy("person")}},
+    )
+    artifact, loaded = services.artifacts.load("tenant-a", result.artifacts[0].id)
+
+    assert artifact.row_count == 4
+    assert loaded["营收完成度"].notna().sum() == 2
+    assert loaded["营收完成度"].dropna().tolist() == [0.8, 0.0]
+    assert loaded["客户"].isna().sum() == 2
+    assert len(services.repository.list_mappings("tenant-a")) == 2
 
 
 def test_detected_sensitive_column_fails_closed_before_persistence(services, workspace):

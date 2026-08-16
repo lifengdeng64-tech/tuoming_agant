@@ -32,7 +32,9 @@ def test_outbound_model_request_contains_no_plaintext_pii(services, workspace):
     )
     model = RecordingModel(plan)
     planner = SafeAnalysisPlanner(None, None, "test", sanitizer, model=model)
-    planner.create_plan(safe_request, {"artifact_catalog": [], "recent_messages": []})
+    planner.create_plan(
+        safe_request, {"artifact_catalog": [], "recent_messages": []}, "tenant-a"
+    )
     serialized = json.dumps(model.messages, ensure_ascii=False)
     assert "13800138000" not in serialized
     assert "PHONE_V1_" in serialized
@@ -47,7 +49,7 @@ def test_planner_rejects_sensitive_content_in_model_output(services):
     )
     planner = SafeAnalysisPlanner(None, None, "test", sanitizer, model=RecordingModel(plan))
     with pytest.raises(SensitiveContentError):
-        planner.create_plan("safe request", {})
+        planner.create_plan("safe request", {}, "tenant-a")
 
 
 def test_unknown_plaintext_pii_is_blocked(services):
@@ -63,6 +65,19 @@ def test_known_text_variants_are_replaced_before_model_request(services):
     sanitizer = PromptSanitizer(services.vault)
     safe = sanitizer.sanitize("tenant-a", "筛选 abc    store 的记录")
     assert safe == f"筛选 {token} 的记录"
+
+
+def test_tenant_plaintext_check_blocks_case_and_whitespace_variants(services):
+    services.vault.tokenize("tenant-a", "store", "ABC Store", "casefold")
+    sanitizer = PromptSanitizer(services.vault)
+
+    for leaked_text in (
+        "结果包含 abc    store",
+        "结果包含 ABC\tSTORE",
+        "结果包含 AbC\nStore",
+    ):
+        with pytest.raises(SensitiveContentError):
+            sanitizer.assert_tenant_safe("tenant-a", leaked_text)
 
 
 def test_tenant_cannot_read_or_restore_other_tenant_data(services, workspace):

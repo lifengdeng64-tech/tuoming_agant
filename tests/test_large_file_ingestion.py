@@ -27,6 +27,7 @@ from tuoming_agent.maintenance import (
 from tuoming_agent.security.crypto import STREAM_MAGIC, derive_key
 from tuoming_agent.security.masking import ColumnPolicy
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
+from tuoming_agent.storage.sqlite import DeletionImpact
 from tuoming_agent.ui import app as ui_app
 
 MIB = 1024 * 1024
@@ -40,6 +41,89 @@ class BoundedReadStream(BytesIO):
         if size is None or size < 0:
             raise AssertionError("stream consumers must use bounded reads")
         return super().read(size)
+
+
+def test_file_deletion_with_analysis_requires_acknowledgement(monkeypatch) -> None:
+    impact = DeletionImpact(
+        file_id="file-a",
+        original_name="wrong.csv",
+        sha256="a" * 64,
+        dataset_version_ids=("version-a",),
+        dataset_ids=("dataset-a",),
+        artifact_ids=("source-a", "result-a"),
+        analysis_run_ids=("run-a",),
+        paths=(Path("source.enc"), Path("source.parquet")),
+    )
+
+    class DataSources:
+        deleted = False
+
+        def inspect(self, *_args):
+            return impact
+
+        def delete(self, *_args):
+            self.deleted = True
+
+    class Services:
+        data_sources = DataSources()
+
+    monkeypatch.setattr(ui_app.st, "session_state", {"pending-delete-workspace": "file-a"})
+    monkeypatch.setattr(ui_app.st, "warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "checkbox", lambda *_args, **_kwargs: False)
+    disabled = []
+
+    def button(label, **kwargs):
+        if label == "确认删除":
+            disabled.append(kwargs["disabled"])
+        return False
+
+    monkeypatch.setattr(ui_app.st, "button", button)
+
+    ui_app._render_file_deletion(Services(), "tenant", "workspace", {"id": "file-a"})
+
+    assert disabled == [True]
+    assert Services.data_sources.deleted is False
+
+
+def test_confirmed_file_deletion_calls_service_and_refreshes(monkeypatch) -> None:
+    impact = DeletionImpact(
+        file_id="file-a",
+        original_name="wrong.csv",
+        sha256="a" * 64,
+        dataset_version_ids=("version-a",),
+        dataset_ids=("dataset-a",),
+        artifact_ids=("source-a",),
+        analysis_run_ids=("run-a",),
+        paths=(Path("source.enc"), Path("source.parquet")),
+    )
+    deleted = []
+
+    class DataSources:
+        def inspect(self, *_args):
+            return impact
+
+        def delete(self, *args):
+            deleted.append(args)
+            return impact
+
+    class Services:
+        data_sources = DataSources()
+
+    state = {"pending-delete-workspace": "file-a"}
+    monkeypatch.setattr(ui_app.st, "session_state", state)
+    monkeypatch.setattr(ui_app.st, "warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "checkbox", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        ui_app.st, "button", lambda label, **_kwargs: label == "确认删除"
+    )
+    monkeypatch.setattr(ui_app.st, "rerun", lambda: None)
+
+    ui_app._render_file_deletion(Services(), "tenant", "workspace", {"id": "file-a"})
+
+    assert deleted == [("tenant", "workspace", "file-a")]
+    assert "pending-delete-workspace" not in state
 
     def read1(self, size: int = -1) -> bytes:
         if size is None or size < 0:
@@ -278,6 +362,47 @@ def test_csv_encoding_retries_after_long_ascii_prefix_before_gbk_text() -> None:
     assert chunks[0].dataframe.iloc[-1, 0] == "中文"
 
 
+def test_excel_parser_normalizes_missing_markers_without_changing_business_values() -> None:
+    content = BytesIO()
+    with pd.ExcelWriter(content, engine="openpyxl") as writer:
+        pd.DataFrame(
+            {
+                "营收完成度": [
+                    0.8,
+                    "NaN",
+                    " n/A ",
+                    "NULL",
+                    "None",
+                    "  ",
+                    0,
+                    "-",
+                    "无",
+                ]
+            }
+        ).to_excel(writer, sheet_name="page", index=False)
+
+    table = preview_file("sales.xlsx", BytesIO(content.getvalue()))[0]
+
+    assert table.dataframe.loc[0, "营收完成度"] == 0.8
+    assert table.dataframe.loc[6:, "营收完成度"].tolist() == [0, "-", "无"]
+    assert table.dataframe.loc[1:5, "营收完成度"].isna().all()
+
+
+def test_csv_chunks_apply_the_same_missing_value_rules_as_preview() -> None:
+    payload = b"status\nNaN\n n/A \nNULL\nNone\n  \n0\n-\n\xe6\x9c\xaa\xe5\xae\x8c\xe6\x88\x90\n"
+
+    preview = preview_file("status.csv", BytesIO(payload))[0].dataframe
+    chunked = pd.concat(
+        [table.dataframe for table in iter_file_chunks("status.csv", BytesIO(payload), 2)],
+        ignore_index=True,
+    )
+
+    assert preview["status"].isna().iloc[:5].all()
+    assert chunked["status"].isna().iloc[:5].all()
+    assert preview["status"].iloc[5:].tolist() == ["0", "-", "未完成"]
+    assert chunked["status"].iloc[5:].tolist() == ["0", "-", "未完成"]
+
+
 def test_excel_parser_uses_cached_formula_values_and_row_chunks() -> None:
     source = BytesIO()
     with pd.ExcelWriter(source, engine="xlsxwriter") as writer:
@@ -376,6 +501,120 @@ def test_artifact_store_writes_multiple_chunks_with_one_schema(tmp_path: Path) -
         {"token": "A", "amount": 3},
     ]
     assert list(path.parent.glob("*.tmp.parquet")) == []
+
+
+def test_artifact_store_widens_schema_when_business_text_appears_late(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    chunks = [
+        pd.DataFrame({"amount": [1, None]}),
+        pd.DataFrame({"amount": ["-", "无"]}),
+    ]
+
+    path = store.write_chunks("tenant-a", "workspace-a", "artifact-a", iter(chunks))
+    loaded = store.read_dataframe(path)
+
+    assert loaded["amount"].iloc[[0, 2, 3]].tolist() == ["1", "-", "无"]
+    assert pd.isna(loaded["amount"].iloc[1])
+    assert list(path.parent.glob("*.tmp.parquet")) == []
+
+
+def test_artifact_store_does_not_wrap_signed_and_unsigned_integers(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    chunks = [
+        pd.DataFrame({"amount": pd.Series([2**63], dtype="uint64")}),
+        pd.DataFrame({"amount": pd.Series([-1], dtype="int64")}),
+    ]
+
+    path = store.write_chunks("tenant-a", "workspace-a", "artifact-a", iter(chunks))
+
+    assert store.read_dataframe(path)["amount"].tolist() == [str(2**63), "-1"]
+
+
+def test_artifact_store_preserves_large_integer_when_float_appears_late(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    chunks = [
+        pd.DataFrame({"amount": pd.Series([2**53 + 1], dtype="int64")}),
+        pd.DataFrame({"amount": pd.Series([1.5], dtype="float64")}),
+    ]
+
+    path = store.write_chunks("tenant-a", "workspace-a", "artifact-a", iter(chunks))
+
+    assert store.read_dataframe(path)["amount"].tolist() == [str(2**53 + 1), "1.5"]
+
+
+def test_artifact_store_keeps_lossless_decimal_and_integer_chunks_numeric(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    chunks = [
+        pd.DataFrame({"amount": [1.5, None]}),
+        pd.DataFrame({"amount": pd.Series([2], dtype="int64")}),
+    ]
+
+    path = store.write_chunks("tenant-a", "workspace-a", "artifact-a", iter(chunks))
+    loaded = store.read_dataframe(path)
+
+    assert pd.api.types.is_float_dtype(loaded["amount"])
+    assert loaded["amount"].dropna().tolist() == [1.5, 2.0]
+
+
+def test_csv_preserves_unlisted_pandas_na_tokens() -> None:
+    content = b"value\nNA\n#N/A\n<NA>\nN/A\nNULL\n"
+
+    preview = preview_file("markers.csv", BytesIO(content))[0].dataframe
+    chunks = list(iter_file_chunks("markers.csv", BytesIO(content), chunk_rows=2))
+    combined = pd.concat([table.dataframe for table in chunks], ignore_index=True)
+
+    assert preview["value"].iloc[:3].tolist() == ["NA", "#N/A", "<NA>"]
+    assert combined["value"].iloc[:3].tolist() == ["NA", "#N/A", "<NA>"]
+    assert preview["value"].iloc[3:].isna().all()
+    assert combined["value"].iloc[3:].isna().all()
+
+
+def test_csv_missing_markers_do_not_force_numeric_columns_to_text(
+    services, workspace
+) -> None:
+    content = b"amount\n1\nNULL\n2\n"
+
+    preview = preview_file("numeric.csv", BytesIO(content))[0].dataframe
+    chunks = list(iter_file_chunks("numeric.csv", BytesIO(content), chunk_rows=2))
+    combined = pd.concat([table.dataframe for table in chunks], ignore_index=True)
+
+    assert pd.api.types.is_numeric_dtype(preview["amount"])
+    assert pd.api.types.is_numeric_dtype(combined["amount"])
+    assert preview["amount"].dropna().tolist() == [1.0, 2.0]
+    assert combined["amount"].dropna().tolist() == [1.0, 2.0]
+
+    result = services.ingestion.ingest(
+        "tenant-a", workspace.id, "numeric.csv", content, {"numeric": {}}
+    )
+    loaded = services.ingestion.artifact_store.read_dataframe(
+        result.artifacts[0].path
+    )
+    assert pd.api.types.is_numeric_dtype(loaded["amount"])
+    assert loaded["amount"].dropna().tolist() == [1.0, 2.0]
+
+
+def test_excel_explicit_text_with_leading_zero_stays_text() -> None:
+    source = BytesIO()
+    with pd.ExcelWriter(source, engine="openpyxl") as writer:
+        pd.DataFrame({"code": ["001", "002", "NULL"]}).to_excel(
+            writer, sheet_name="codes", index=False
+        )
+    content = source.getvalue()
+
+    preview = preview_file("codes.xlsx", BytesIO(content))[0].dataframe
+    chunks = list(iter_file_chunks("codes.xlsx", BytesIO(content), chunk_rows=2))
+    combined = pd.concat([table.dataframe for table in chunks], ignore_index=True)
+
+    assert preview["code"].dropna().tolist() == ["001", "002"]
+    assert combined["code"].dropna().tolist() == ["001", "002"]
 
 
 def test_ingestion_validates_sensitive_values_discovered_in_a_later_batch(

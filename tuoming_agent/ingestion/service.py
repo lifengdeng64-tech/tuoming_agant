@@ -72,20 +72,30 @@ class IngestionService:
             byte_size,
             self.temp_reserve_bytes,
         )
-        duplicate = self.repository.find_file_by_hash(tenant_id, workspace_id, content_hash)
-        if duplicate:
-            versions = self.repository.get_file_versions(tenant_id, duplicate["id"])
-            artifacts = tuple(
-                self.repository.get_artifact(tenant_id, version["artifact_id"])
-                for version in versions
-            )
-            return IngestionResult(duplicate["id"], content_hash, artifacts, True)
+        existing_file = self.repository.find_file_by_hash(
+            tenant_id, workspace_id, content_hash
+        )
+        existing_versions = (
+            self.repository.get_file_versions(tenant_id, existing_file["id"])
+            if existing_file
+            else []
+        )
+        existing_table_keys = {version["sheet_name"] for version in existing_versions}
+        existing_stem = (
+            Path(existing_file["original_name"]).stem.strip() or "dataset"
+            if existing_file
+            else None
+        )
 
         source.seek(0)
         table_names: list[str] = []
+        table_keys: set[str | None] = set()
         for table in iter_file_chunks(filename, source):
             if table.logical_name not in table_names:
                 table_names.append(table.logical_name)
+            table_keys.add(table.sheet_name)
+            if table.sheet_name in existing_table_keys:
+                continue
             table_policies = policies.get(table.logical_name, {})
             table_retained = retained_columns.get(table.logical_name, set())
             detected = detect_sensitive_columns(table.dataframe, sample_size=None)
@@ -99,6 +109,12 @@ class IngestionService:
                 )
         if not table_names:
             raise ValueError("The upload contains no tabular rows.")
+        if existing_file and table_keys <= existing_table_keys:
+            artifacts = tuple(
+                self.repository.get_artifact(tenant_id, version["artifact_id"])
+                for version in existing_versions
+            )
+            return IngestionResult(existing_file["id"], content_hash, artifacts, True)
 
         pending: list[tuple[ArtifactRecord, str | None, dict[str, ColumnPolicy]]] = []
         created_paths: list[Path] = []
@@ -106,7 +122,11 @@ class IngestionService:
         encrypted_created = False
         source.seek(0)
         try:
-            chunks = iter_file_chunks(filename, source)
+            chunks = (
+                table
+                for table in iter_file_chunks(filename, source)
+                if table.sheet_name not in existing_table_keys
+            )
             for logical_name, table_chunks in groupby(chunks, key=lambda table: table.logical_name):
                 artifact_id = str(uuid.uuid4())
                 table_policies = policies.get(logical_name, {})
@@ -148,6 +168,12 @@ class IngestionService:
                 artifact_path = self.artifact_store.write_chunks(
                     tenant_id, workspace_id, artifact_id, masked_chunks()
                 )
+                schema, row_count = self.artifact_store.inspect_parquet(artifact_path)
+                artifact_name = (
+                    f"{existing_stem}::{sheet_name}"
+                    if existing_stem and sheet_name is not None
+                    else existing_stem or logical_name
+                )
                 created_paths.append(artifact_path)
                 pending.append(
                     (
@@ -156,7 +182,7 @@ class IngestionService:
                             tenant_id=tenant_id,
                             workspace_id=workspace_id,
                             kind="dataset",
-                            name=logical_name,
+                            name=artifact_name,
                             path=artifact_path,
                             row_count=row_count,
                             schema=schema or {"columns": []},
@@ -169,15 +195,21 @@ class IngestionService:
                     )
                 )
 
-            source.seek(0)
-            (
-                encrypted_path,
-                streamed_hash,
-                streamed_size,
-                encrypted_created,
-            ) = self.secure_file_store.write_stream(tenant_id, workspace_id, source)
-            if streamed_hash != content_hash or streamed_size != byte_size:
-                raise ValueError("Upload changed while it was being ingested.")
+            if existing_file:
+                streamed_size, streamed_hash = self._measure_and_hash(source)
+                if streamed_hash != content_hash or streamed_size != byte_size:
+                    raise ValueError("Upload changed while it was being ingested.")
+                encrypted_path = Path(existing_file["encrypted_path"])
+            else:
+                source.seek(0)
+                (
+                    encrypted_path,
+                    streamed_hash,
+                    streamed_size,
+                    encrypted_created,
+                ) = self.secure_file_store.write_stream(tenant_id, workspace_id, source)
+                if streamed_hash != content_hash or streamed_size != byte_size:
+                    raise ValueError("Upload changed while it was being ingested.")
         except Exception:
             for path in created_paths:
                 path.unlink(missing_ok=True)
@@ -200,6 +232,47 @@ class IngestionService:
             )
             for artifact, sheet_name, table_policies in pending
         ]
+        if existing_file:
+            try:
+                published_ids = set(
+                    self.repository.publish_tables_for_existing_file(
+                        tenant_id,
+                        workspace_id,
+                        existing_file["id"],
+                        publication,
+                    )
+                )
+            except Exception:
+                for path in created_paths:
+                    path.unlink(missing_ok=True)
+                raise
+            for artifact, _sheet_name, _policies in pending:
+                if artifact.id not in published_ids:
+                    artifact.path.unlink(missing_ok=True)
+            versions = self.repository.get_file_versions(tenant_id, existing_file["id"])
+            artifacts = tuple(
+                self.repository.get_artifact(tenant_id, version["artifact_id"])
+                for version in versions
+            )
+            if not published_ids:
+                return IngestionResult(existing_file["id"], content_hash, artifacts, True)
+            self.repository.touch_workspace(tenant_id, workspace_id)
+            self.repository.add_audit_event(
+                tenant_id,
+                "file_ingested",
+                workspace_id,
+                {
+                    "sha256_prefix": content_hash[:12],
+                    "table_count": len(published_ids),
+                    "retained_sensitive_columns": {
+                        table_name: sorted(columns)
+                        for table_name, columns in retained_sensitive_columns.items()
+                        if columns
+                    },
+                },
+            )
+            return IngestionResult(existing_file["id"], content_hash, artifacts, False)
+
         try:
             file_record, lost_race = self.repository.publish_ingestion(
                 tenant_id,
