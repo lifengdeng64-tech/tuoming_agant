@@ -9,13 +9,19 @@ $ErrorActionPreference = "Stop"
 Set-Location (Resolve-Path (Join-Path $PSScriptRoot ".."))
 
 python -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed." }
 python -m pip install -e ".[desktop,dev]"
+if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
 if (-not $SkipTests) {
     python -m pytest
+    if ($LASTEXITCODE -ne 0) { throw "Tests failed." }
     python -m ruff check .
+    if ($LASTEXITCODE -ne 0) { throw "Ruff failed." }
     python -m compileall -q tuoming_agent
+    if ($LASTEXITCODE -ne 0) { throw "compileall failed." }
 }
 python -m PyInstaller --clean --noconfirm TuomingAgent.spec
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 
 & "$PSScriptRoot\sign_windows.ps1" -Files "dist\TuomingAgent\TuomingAgent.exe" -Required:$RequireSignature
 Compress-Archive -Path "dist\TuomingAgent\*" -DestinationPath "dist\TuomingAgent-Windows-x64.zip" -CompressionLevel Optimal -Force

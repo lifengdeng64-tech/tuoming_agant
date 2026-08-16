@@ -2,6 +2,12 @@ name: Windows Release
 
 on:
   workflow_dispatch:
+    inputs:
+      portable_only:
+        description: "Build an unsigned portable beta without the installer"
+        required: true
+        type: boolean
+        default: true
   push:
     tags:
       - "v*"
@@ -12,6 +18,9 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      IS_TAG_RELEASE: ${{ startsWith(github.ref, 'refs/tags/') }}
+      PORTABLE_ONLY: ${{ contains(github.ref_name, '-') || (github.event_name == 'workflow_dispatch' && inputs.portable_only) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,28 +28,41 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install Inno Setup
+        if: env.PORTABLE_ONLY != 'true'
         shell: pwsh
         run: choco install innosetup --no-progress -y
-      - name: Build, sign and verify
+      - name: Build and verify Windows artifacts
         shell: pwsh
         env:
           WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
           WINDOWS_SIGNING_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
           WINDOWS_SIGNING_TIMESTAMP_URL: ${{ vars.WINDOWS_SIGNING_TIMESTAMP_URL }}
         run: |
-          $requireSignature = "${{ startsWith(github.ref, 'refs/tags/') }}" -eq "true"
-          ./scripts/build_windows.ps1 -RequireSignature:$requireSignature -RequireAntivirus:$requireSignature
-          ./scripts/verify_windows_release.ps1 -RequireSignature:$requireSignature
+          $portableOnly = $env:PORTABLE_ONLY -eq "true"
+          $requireSignature = ($env:IS_TAG_RELEASE -eq "true") -and (-not $portableOnly)
+          ./scripts/build_windows.ps1 `
+            -SkipInstaller:$portableOnly `
+            -RequireSignature:$requireSignature `
+            -RequireAntivirus:$requireSignature
+          ./scripts/verify_windows_release.ps1 `
+            -SkipInstaller:$portableOnly `
+            -RequireSignature:$requireSignature
       - uses: actions/upload-artifact@v4
         with:
           name: TuomingAgent-Windows
           path: |
-            dist/TuomingAgent-Setup.exe
-            dist/TuomingAgent-Setup.exe.sha256
             dist/TuomingAgent-Windows-x64.zip
             dist/TuomingAgent-Windows-x64.zip.sha256
+      - name: Upload installer build artifact
+        if: env.PORTABLE_ONLY != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: TuomingAgent-Windows-Installer
+          path: |
+            dist/TuomingAgent-Setup.exe
+            dist/TuomingAgent-Setup.exe.sha256
       - name: Optional VirusTotal upload
-        if: startsWith(github.ref, 'refs/tags/') && env.VT_API_KEY != ''
+        if: startsWith(github.ref, 'refs/tags/') && env.PORTABLE_ONLY != 'true' && env.VT_API_KEY != ''
         shell: pwsh
         env:
           VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
@@ -56,14 +78,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
+          $portableOnly = $env:PORTABLE_ONLY -eq "true"
           $assets = @(
-            "dist/TuomingAgent-Setup.exe",
-            "dist/TuomingAgent-Setup.exe.sha256",
             "dist/TuomingAgent-Windows-x64.zip",
             "dist/TuomingAgent-Windows-x64.zip.sha256"
           )
+          if (-not $portableOnly) {
+            $assets += @(
+              "dist/TuomingAgent-Setup.exe",
+              "dist/TuomingAgent-Setup.exe.sha256"
+            )
+          }
           if (gh release view $tag 2>$null) {
             gh release upload $tag $assets --clobber
+          } elseif ($portableOnly) {
+            gh release create $tag $assets `
+              --prerelease `
+              --title "Tuoming Agent $tag (unsigned portable beta)" `
+              --notes "Unsigned internal-test portable build. Extract the ZIP and double-click TuomingAgent.exe. Windows SmartScreen may show an unknown publisher warning."
           } else {
             gh release create $tag $assets --generate-notes --title "Tuoming Agent $tag"
           }
