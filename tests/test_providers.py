@@ -55,7 +55,7 @@ def test_provider_factory_rejects_invalid_endpoint() -> None:
         (type("Unauthorized", (Exception,), {"status_code": 401})("bad key"), "API Key"),
         (type("Missing", (Exception,), {"status_code": 404})("model not found"), "模型不存在"),
         (type("NoCredit", (Exception,), {"status_code": 402})("billing"), "额度不足"),
-        (TimeoutError("network timeout"), "网络连接失败"),
+        (TimeoutError("network timeout"), "模型响应超时"),
     ],
 )
 def test_provider_errors_are_classified_without_raw_service_details(error, expected) -> None:
