@@ -4,6 +4,10 @@ import json
 
 import pytest
 
+from tuoming_agent.analysis.errors import (
+    AnalysisPlanValidationError,
+    AnalysisProviderError,
+)
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.naming import (
     GeneratedNameValidationError,
@@ -61,9 +65,7 @@ def test_deepseek_uses_supported_json_object_output(monkeypatch, services) -> No
         PromptSanitizer(services.vault),
     )
 
-    assert created[0].structured_calls == [
-        (AnalysisPlan, {"method": "json_mode"})
-    ]
+    assert created[0].structured_calls == [(AnalysisPlan, {"method": "json_mode"})]
 
 
 def test_non_deepseek_keeps_strict_json_schema_output(monkeypatch, services) -> None:
@@ -84,9 +86,7 @@ def test_non_deepseek_keeps_strict_json_schema_output(monkeypatch, services) -> 
         provider_name="openai",
     )
 
-    assert created[0].structured_calls == [
-        (AnalysisPlan, {"method": "json_schema"})
-    ]
+    assert created[0].structured_calls == [(AnalysisPlan, {"method": "json_schema"})]
 
 
 def test_planner_sends_exact_analysis_plan_schema_with_json_request(services) -> None:
@@ -142,9 +142,7 @@ def test_generated_name_issues_accept_chinese_names_and_digits() -> None:
             {
                 "action": "groupby",
                 "by": ["brand_code"],
-                "aggregations": [
-                    {"column": "revenue", "function": "sum", "output": "本期营收"}
-                ],
+                "aggregations": [{"column": "revenue", "function": "sum", "output": "本期营收"}],
             },
             {"action": "derive", "column": "营收同比2026", "expression": "col('revenue') / 2"},
             {"action": "rename", "mapping": {"brand_code": "品牌编码"}},
@@ -268,3 +266,60 @@ def test_planner_rejects_second_invalid_generated_name_response(services) -> Non
         planner.create_plan("汇总营收", {"artifact_catalog": []}, "tenant-a")
 
     assert len(model.calls) == 2
+
+
+class FailingPlanModel:
+    def __init__(self, error: Exception):
+        self.error = error
+
+    def invoke(self, _messages):
+        raise self.error
+
+
+class ProviderStatusError(RuntimeError):
+    def __init__(self, status_code: int, message: str):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def test_planner_classifies_provider_failure_without_exposing_secret(services) -> None:
+    api_key = "sk-sensitive-provider-key"
+    planner = SafeAnalysisPlanner(
+        api_key,
+        None,
+        "test",
+        PromptSanitizer(services.vault),
+        model=FailingPlanModel(ProviderStatusError(401, f"invalid api key: {api_key}")),
+    )
+
+    with pytest.raises(AnalysisProviderError) as captured:
+        planner.create_plan("汇总营收", {"artifact_catalog": []}, "tenant-a")
+
+    assert captured.value.error_code == "provider_auth"
+    assert str(captured.value) == "API Key 无效或没有访问权限。"
+    assert api_key not in str(captured.value)
+
+
+def test_planner_reports_invalid_structured_plan_separately(services) -> None:
+    planner = SafeAnalysisPlanner(
+        None,
+        None,
+        "test",
+        PromptSanitizer(services.vault),
+        model=RecordingPlanModel({"input_artifact_id": "artifact-id", "operations": []}),
+    )
+
+    with pytest.raises(AnalysisPlanValidationError) as captured:
+        planner.create_plan("汇总营收", {"artifact_catalog": []}, "tenant-a")
+
+    assert captured.value.error_code == "plan_validation"
+    assert "计划格式不符合安全规则" in str(captured.value)
+
+
+def test_planner_prompt_defines_weighted_completion_recipe() -> None:
+    from tuoming_agent.analysis.planner import PLANNER_SYSTEM_PROMPT
+
+    assert "do not average row-level completion percentages" in PLANNER_SYSTEM_PROMPT
+    assert 'operator "ne" and value “临时停业”' in PLANNER_SYSTEM_PROMPT
+    assert "summed actual / summed target" in PLANNER_SYSTEM_PROMPT
+    assert "current completion / prior completion - 1" in PLANNER_SYSTEM_PROMPT

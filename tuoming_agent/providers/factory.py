@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ssl
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
@@ -144,6 +145,16 @@ def _test_client(client: Any, api_key: str) -> ProviderConnectionResult:
 
 
 def classify_provider_error(exc: Exception, api_key: str = "") -> str:
+    return provider_error_details(exc, api_key).message
+
+
+@dataclass(frozen=True)
+class ProviderErrorDetails:
+    code: str
+    message: str
+
+
+def provider_error_details(exc: Exception, api_key: str = "") -> ProviderErrorDetails:
     status_code = getattr(exc, "status_code", None)
     response = getattr(exc, "response", None)
     if status_code is None and response is not None:
@@ -155,23 +166,35 @@ def classify_provider_error(exc: Exception, api_key: str = "") -> str:
     if status_code in {401, 403} or any(
         token in message for token in ("invalid api key", "authentication", "unauthorized")
     ):
-        return "API Key 无效或没有访问权限。"
+        return ProviderErrorDetails("provider_auth", "API Key 无效或没有访问权限。")
     if status_code == 404 or any(
         token in message for token in ("model not found", "does not exist", "unknown model")
     ):
-        return "模型不存在或当前账号没有该模型的访问权限。"
+        return ProviderErrorDetails(
+            "provider_model_not_found", "模型不存在或当前账号没有该模型的访问权限。"
+        )
     if status_code == 402 or any(
         token in message for token in ("insufficient balance", "insufficient quota", "billing")
     ):
-        return "API 余额或额度不足。"
+        return ProviderErrorDetails("provider_quota", "API 余额或额度不足。")
     if any(token in message for token in ("certificate verify", "tls", "ssl")):
-        return "TLS 证书验证失败，请检查企业 CA 文件或 TLS 检查设备。"
+        return ProviderErrorDetails(
+            "provider_tls", "TLS 证书验证失败，请检查企业 CA 文件或 TLS 检查设备。"
+        )
     if any(token in message for token in ("proxy", "407")):
-        return "企业代理连接失败，请检查 Windows 系统代理或代理地址。"
+        return ProviderErrorDetails(
+            "provider_proxy", "企业代理连接失败，请检查 Windows 系统代理或代理地址。"
+        )
     if any(token in message for token in ("connection", "connect", "timeout", "network")):
-        return "网络连接失败，请检查网络、代理和防火墙设置。"
+        return ProviderErrorDetails(
+            "provider_network", "网络连接失败，请检查网络、代理和防火墙设置。"
+        )
     if any(token in message for token in ("base url", "invalid url", "name resolution")):
-        return "Base URL 无效或无法访问。"
+        return ProviderErrorDetails("provider_base_url", "Base URL 无效或无法访问。")
     if status_code:
-        return f"服务商返回错误（HTTP {status_code}）。"
-    return "模型连接失败，请核对服务商、模型名称与 Base URL。"
+        return ProviderErrorDetails(
+            "provider_http_error", f"服务商返回错误（HTTP {status_code}）。"
+        )
+    return ProviderErrorDetails(
+        "provider_unavailable", "模型连接失败，请核对服务商、模型名称与 Base URL。"
+    )

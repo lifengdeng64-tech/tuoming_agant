@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
+from tuoming_agent.analysis.errors import AnalysisProviderError
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.naming import GeneratedNameValidationError
 from tuoming_agent.config import AppConfig
@@ -147,6 +148,95 @@ def test_generated_name_error_is_shown_in_chinese(monkeypatch, tmp_path: Path):
     assert errors == [message]
 
 
+def test_provider_error_is_actionable_and_audit_stays_safe(monkeypatch, tmp_path: Path):
+    message = "模型服务认证失败，请检查 API Key。"
+    audit_events: list[tuple] = []
+
+    class Conversations:
+        sanitizer = object()
+
+        @staticmethod
+        def add_user_message(*_args):
+            return SimpleNamespace(id="message-a", safe_content="汇总营收")
+
+        @staticmethod
+        def build_safe_context(*_args, **_kwargs):
+            return {}
+
+    class Repository:
+        @staticmethod
+        def list_messages(*_args, **_kwargs):
+            return []
+
+        @staticmethod
+        def add_audit_event(*args):
+            audit_events.append(args)
+
+    class Workflow:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def latest_for_conversation(*_args):
+            return None
+
+        @staticmethod
+        def start(*_args, **_kwargs):
+            raise AnalysisProviderError(message, "provider_auth")
+
+    services = SimpleNamespace(
+        artifacts=object(),
+        conversations=Conversations(),
+        repository=Repository(),
+    )
+    artifact = SimpleNamespace(
+        id="artifact-a",
+        schema={"columns": [{"name": "revenue"}]},
+        row_count=2,
+        lineage=(),
+    )
+    config = AppConfig(
+        master_key=b"k" * 32,
+        key_version=1,
+        data_dir=tmp_path,
+        default_tenant="tenant-a",
+        analyst_api_key="test-key",
+    )
+    errors: list[str] = []
+
+    monkeypatch.setattr(ui_app, "SafeAnalysisPlanner", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(ui_app, "AnalysisWorkflowService", Workflow)
+    monkeypatch.setattr(ui_app, "_section_heading", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app, "_empty_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "selectbox", lambda *_args, **_kwargs: "artifact-a")
+    monkeypatch.setattr(ui_app.st, "caption", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "divider", lambda: None)
+    monkeypatch.setattr(ui_app.st, "markdown", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ui_app.st, "chat_input", lambda *_args, **_kwargs: "汇总营收")
+    monkeypatch.setattr(ui_app.st, "chat_message", lambda *_args, **_kwargs: _EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "spinner", lambda *_args, **_kwargs: _EmptyContainer())
+    monkeypatch.setattr(ui_app.st, "error", errors.append)
+
+    ui_app._render_analysis_view(
+        services,
+        config,
+        "tenant-a",
+        "workspace-a",
+        "conversation-a",
+        [artifact],
+    )
+
+    assert errors == [message]
+    assert audit_events == [
+        (
+            "tenant-a",
+            "analysis_failed",
+            "workspace-a",
+            {"source_artifact_id": "artifact-a", "error_code": "provider_auth"},
+        )
+    ]
+
+
 def test_revision_generated_name_error_is_shown_without_rerun(monkeypatch):
     message = "模型未能生成合规的中文字段名称，请重试。"
     plan = AnalysisPlan(
@@ -217,9 +307,7 @@ def test_revision_generated_name_error_is_shown_without_rerun(monkeypatch):
     monkeypatch.setattr(
         ui_app,
         "_set_flash",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("命名错误不应显示成功通知")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("命名错误不应显示成功通知")),
     )
 
     ui_app._render_workflow_card(
@@ -304,9 +392,7 @@ def test_revision_sensitive_feedback_is_shown_without_rerun(monkeypatch):
     monkeypatch.setattr(
         ui_app,
         "_set_flash",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("敏感反馈不应显示成功通知")
-        ),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("敏感反馈不应显示成功通知")),
     )
 
     ui_app._render_workflow_card(
@@ -377,9 +463,7 @@ def test_table_deletion_requires_acknowledgement_for_related_analysis(monkeypatc
     assert disabled == [True]
     assert Services.data_sources.deleted is False
     assert any(
-        "book::page" in warning
-        and "643" in warning
-        and "关联对话 2 条" in warning
+        "book::page" in warning and "643" in warning and "关联对话 2 条" in warning
         for warning in warnings
     )
 
@@ -551,7 +635,6 @@ def test_streamlit_workspace_renders_without_runtime_errors(monkeypatch, tmp_pat
     ]
 
 
-
 @pytest.mark.skipif(os.name != "nt", reason="desktop onboarding uses Windows DPAPI")
 def test_first_run_initializes_local_security_and_shows_model_setup(
     monkeypatch, tmp_path: Path
@@ -575,6 +658,7 @@ def test_first_run_initializes_local_security_and_shows_model_setup(
     assert len(secret_store.get(MASTER_KEY_CREDENTIAL) or b"") == 32
     settings_text = (app_dir / "settings.json").read_text(encoding="utf-8")
     assert "masking-master-key" not in settings_text
+
 
 def test_results_page_uses_bounded_preview_without_eager_full_load(monkeypatch, tmp_path: Path):
     encoded_key = base64.urlsafe_b64encode(b"k" * 32).decode("ascii")
@@ -638,9 +722,7 @@ def test_streamlit_restores_pending_plan_and_requires_confirmation(monkeypatch, 
         {},
         (),
     )
-    conversation = services.repository.create_conversation(
-        "ui-workflow-tenant", workspace.id
-    )
+    conversation = services.repository.create_conversation("ui-workflow-tenant", workspace.id)
     run = services.repository.create_analysis_run(
         "ui-workflow-tenant",
         workspace.id,
@@ -654,9 +736,7 @@ def test_streamlit_restores_pending_plan_and_requires_confirmation(monkeypatch, 
     plan = AnalysisPlan(
         input_artifact_id=source.id,
         result_name="销售预览",
-        operations=[
-            {"action": "filter", "column": "品牌名称", "operator": "eq", "value": token}
-        ],
+        operations=[{"action": "filter", "column": "品牌名称", "operator": "eq", "value": token}],
     )
     services.repository.create_analysis_plan_version(
         "ui-workflow-tenant", run["id"], plan.model_dump(mode="json"), "initial"
@@ -679,7 +759,7 @@ def test_streamlit_restores_pending_plan_and_requires_confirmation(monkeypatch, 
     assert any("结果名称：销售预览" in item.value for item in app.markdown)
     assert any("'华住'" in item.value for item in app.markdown)
 
-    stored_plan = services.repository.list_analysis_plan_versions(
-        "ui-workflow-tenant", run["id"]
-    )[0]
+    stored_plan = services.repository.list_analysis_plan_versions("ui-workflow-tenant", run["id"])[
+        0
+    ]
     assert stored_plan["plan"]["operations"][0]["value"] == token

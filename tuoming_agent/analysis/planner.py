@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from langchain_core.exceptions import OutputParserException
+from pydantic import ValidationError
+
+from tuoming_agent.analysis.errors import AnalysisPlanValidationError, AnalysisProviderError
 from tuoming_agent.analysis.models import AnalysisPlan, FillnaOperation, FilterOperation
 from tuoming_agent.analysis.naming import (
     GENERATED_NAME_RULE,
@@ -10,7 +14,7 @@ from tuoming_agent.analysis.naming import (
     generated_name_issue_paths,
     generated_names,
 )
-from tuoming_agent.providers import AnalysisModelProvider, create_provider
+from tuoming_agent.providers import AnalysisModelProvider, create_provider, provider_error_details
 from tuoming_agent.security.dlp import PromptSanitizer
 from tuoming_agent.settings import PROVIDER_BY_ID, ModelSettings, NetworkSettings
 
@@ -22,6 +26,15 @@ deduplicate, merge, groupby, derive, head, tail.
 Artifact data is already pseudonymized. Use exact artifact IDs and exact schema column names.
 For derive expressions, use only arithmetic and col('column name').
 Do not place personal data in result_name or safe_summary.
+Apply row filters before aggregation. For “剔除临时停业”, filter the exact status column
+with operator "ne" and value “临时停业” before grouping.
+For weighted completion, do not average row-level completion percentages. Prefer additive
+numerators and denominators: group by the requested dimensions, sum actual and target values,
+then derive completion = summed actual / summed target. For completion同比, also sum the
+prior-period actual and target values, derive prior completion, then derive
+同比 = current completion / prior completion - 1. If the schema instead provides a metric and
+an explicit weight, derive metric * weight before grouping, sum that contribution and the weight,
+then divide the two sums. Use only columns that actually exist in the supplied schema.
 {GENERATED_NAME_RULE}
 This rule applies only to result_name, aggregation outputs, derive columns, rename targets,
 and merge suffixes. Never translate source column references.
@@ -59,6 +72,8 @@ class SafeAnalysisPlanner:
         self.model = model
         self.sanitizer = sanitizer
 
+        self.api_key = api_key or ""
+
     def create_plan(
         self, safe_request: str, safe_context: dict[str, Any], tenant_id: str
     ) -> AnalysisPlan:
@@ -74,17 +89,32 @@ class SafeAnalysisPlanner:
                 separators=(",", ":"),
             )
             self.sanitizer.assert_safe(payload)
-            result = self.model.invoke(
-                [
-                    ("system", PLANNER_SYSTEM_PROMPT),
-                    ("user", payload),
-                ]
-            )
-            plan = (
-                result
-                if isinstance(result, AnalysisPlan)
-                else AnalysisPlan.model_validate(result)
-            )
+            try:
+                result = self.model.invoke(
+                    [
+                        ("system", PLANNER_SYSTEM_PROMPT),
+                        ("user", payload),
+                    ]
+                )
+            except (OutputParserException, ValidationError) as exc:
+                raise AnalysisPlanValidationError(
+                    "模型已响应，但返回的分析计划格式不符合安全规则，请重试或拆分分析步骤。",
+                    "plan_validation",
+                ) from exc
+            except Exception as exc:
+                details = provider_error_details(exc, self.api_key)
+                raise AnalysisProviderError(details.message, details.code) from exc
+            try:
+                plan = (
+                    result
+                    if isinstance(result, AnalysisPlan)
+                    else AnalysisPlan.model_validate(result)
+                )
+            except ValidationError as exc:
+                raise AnalysisPlanValidationError(
+                    "模型已响应，但返回的分析计划格式不符合安全规则，请重试或拆分分析步骤。",
+                    "plan_validation",
+                ) from exc
             self.sanitizer.assert_tenant_safe(
                 tenant_id,
                 json.dumps(
@@ -98,9 +128,7 @@ class SafeAnalysisPlanner:
             if not issue_paths:
                 return plan
             if attempt == 1:
-                raise GeneratedNameValidationError(
-                    "模型未能生成合规的中文字段名称，请重试。"
-                )
+                raise GeneratedNameValidationError("模型未能生成合规的中文字段名称，请重试。")
             payload_data = {
                 **payload_data,
                 "generated_name_feedback": {

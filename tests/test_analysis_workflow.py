@@ -3,6 +3,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from tuoming_agent.analysis.errors import AnalysisServiceError
 from tuoming_agent.analysis.executor import AnalysisResourceError
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.naming import GeneratedNameValidationError
@@ -18,9 +19,7 @@ class QueuePlanner:
         self.plans = list(plans)
         self.calls: list[tuple[str, dict]] = []
 
-    def create_plan(
-        self, safe_request: str, safe_context: dict, _tenant_id: str
-    ) -> AnalysisPlan:
+    def create_plan(self, safe_request: str, safe_context: dict, _tenant_id: str) -> AnalysisPlan:
         self.calls.append((safe_request, safe_context))
         return self.plans.pop(0)
 
@@ -84,9 +83,7 @@ def test_request_message_links_an_analysis_run_and_response(services, workspace)
     workflow = AnalysisWorkflowService(
         services.repository, services.artifacts, QueuePlanner([_plan(source.id)])
     )
-    request = services.conversations.add_user_message(
-        "tenant-a", conversation["id"], "汇总营收"
-    )
+    request = services.conversations.add_user_message("tenant-a", conversation["id"], "汇总营收")
 
     started = workflow.start(
         "tenant-a",
@@ -136,9 +133,7 @@ def test_invalid_generated_names_never_persist_a_plan_version(services, workspac
             {},
         )
 
-    run = services.repository.list_analysis_runs(
-        "tenant-a", workspace.id, conversation["id"]
-    )[0]
+    run = services.repository.list_analysis_runs("tenant-a", workspace.id, conversation["id"])[0]
     assert run["status"] == "failed"
     assert services.repository.list_analysis_plan_versions("tenant-a", run["id"]) == []
 
@@ -177,9 +172,7 @@ def test_initial_plan_rejects_generated_name_pii_before_persistence(services, wo
             {},
         )
 
-    run = services.repository.list_analysis_runs(
-        "tenant-a", workspace.id, conversation["id"]
-    )[0]
+    run = services.repository.list_analysis_runs("tenant-a", workspace.id, conversation["id"])[0]
     assert services.repository.list_analysis_plan_versions("tenant-a", run["id"]) == []
     assert len(model.calls) == 1
 
@@ -218,9 +211,7 @@ def test_source_column_pii_reference_and_tokenized_value_are_preserved(services,
     assert operation.value == token
 
 
-def test_revision_rejects_known_plaintext_filter_value_before_persistence(
-    services, workspace
-):
+def test_revision_rejects_known_plaintext_filter_value_before_persistence(services, workspace):
     source = _source(services, workspace)
     conversation = _conversation(services, workspace)
     services.vault.tokenize("tenant-a", "brand", "华住")
@@ -232,9 +223,7 @@ def test_revision_rejects_known_plaintext_filter_value_before_persistence(
     unsafe_revision = AnalysisPlan(
         input_artifact_id=source.id,
         result_name="品牌营收",
-        operations=[
-            {"action": "filter", "column": "store", "operator": "eq", "value": "华住"}
-        ],
+        operations=[{"action": "filter", "column": "store", "operator": "eq", "value": "华住"}],
     )
     model = SequencePlanModel([initial, unsafe_revision])
     planner = SafeAnalysisPlanner(
@@ -252,9 +241,7 @@ def test_revision_rejects_known_plaintext_filter_value_before_persistence(
     with pytest.raises(SensitiveContentError):
         workflow.revise("tenant-a", started.run["id"], "只看华住", {})
 
-    versions = services.repository.list_analysis_plan_versions(
-        "tenant-a", started.run["id"]
-    )
+    versions = services.repository.list_analysis_plan_versions("tenant-a", started.run["id"])
     assert len(versions) == 1
     assert versions[0]["decision"] == "pending"
     assert len(model.calls) == 2
@@ -502,9 +489,7 @@ def test_workflow_publishes_disk_candidate_only_after_quality_success(
     finished = workflow.confirm("tenant-a", started.run["id"])
 
     assert finished.run["status"] == "completed", finished.run["error_message"]
-    result = services.repository.get_artifact(
-        "tenant-a", finished.run["result_artifact_id"]
-    )
+    result = services.repository.get_artifact("tenant-a", finished.run["result_artifact_id"])
     assert result.path.is_file()
     assert not list(
         (services.artifacts.artifact_store.root / "analysis-candidates").rglob("*.parquet")
@@ -533,3 +518,37 @@ def test_resource_limit_error_is_actionable_terminal_and_never_repaired(
     assert "reduce input size" in failed.run["error_message"]
     assert failed.attempts[-1].error_kind == "terminal"
     assert len(planner.calls) == 1
+
+
+def test_planning_failure_persists_only_safe_error_details(services, workspace):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    leaked_value = "raw-provider-response-with-private-data"
+
+    class UnsafeFailingPlanner:
+        @staticmethod
+        def create_plan(*_args, **_kwargs):
+            raise RuntimeError(leaked_value)
+
+    workflow = AnalysisWorkflowService(
+        services.repository,
+        services.artifacts,
+        UnsafeFailingPlanner(),
+    )
+
+    with pytest.raises(AnalysisServiceError) as captured:
+        workflow.start(
+            "tenant-a",
+            workspace.id,
+            conversation["id"],
+            source.id,
+            "汇总营收",
+            {},
+        )
+
+    run = services.repository.list_analysis_runs("tenant-a", workspace.id, conversation["id"])[0]
+    assert captured.value.error_code == "planning_internal"
+    assert run["status"] == "failed"
+    assert run["error_kind"] == "terminal"
+    assert run["error_message"] == "分析计划生成失败，请重试；如持续失败，请检查模型设置。"
+    assert leaked_value not in run["error_message"]

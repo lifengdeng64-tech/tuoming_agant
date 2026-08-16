@@ -4,10 +4,12 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from tuoming_agent.analysis.errors import SecurityPolicyViolation
+from tuoming_agent.analysis.errors import AnalysisServiceError, SecurityPolicyViolation
 from tuoming_agent.analysis.executor import AnalysisExecutionError, AnalysisExecutor
 from tuoming_agent.analysis.models import AnalysisPlan
+from tuoming_agent.analysis.naming import GeneratedNameValidationError
 from tuoming_agent.analysis.quality import AnalysisQualityValidator, QualityReport
+from tuoming_agent.security.dlp import SensitiveContentError
 from tuoming_agent.storage.errors import AuthorizationError
 from tuoming_agent.storage.sqlite import SQLiteRepository
 from tuoming_agent.workspace.service import ArtifactService
@@ -117,16 +119,37 @@ class AnalysisWorkflowService:
                 error_kind="security",
                 error_message=str(exc),
             )
+        except (GeneratedNameValidationError, SensitiveContentError) as exc:
+            self.repository.update_analysis_run(
+                tenant_id,
+                run["id"],
+                expected_status="planning",
+                status="failed",
+                error_kind="validation",
+                error_message=str(exc),
+            )
+            raise
+        except AnalysisServiceError as exc:
+            self.repository.update_analysis_run(
+                tenant_id,
+                run["id"],
+                expected_status="planning",
+                status="failed",
+                error_kind=exc.error_code,
+                error_message=exc.public_message,
+            )
+            raise
         except Exception as exc:
+            public_message = "分析计划生成失败，请重试；如持续失败，请检查模型设置。"
             self.repository.update_analysis_run(
                 tenant_id,
                 run["id"],
                 expected_status="planning",
                 status="failed",
                 error_kind="terminal",
-                error_message=str(exc),
+                error_message=public_message,
             )
-            raise
+            raise AnalysisServiceError(public_message, "planning_internal") from exc
         return self.get_snapshot(tenant_id, run["id"])
 
     def get_snapshot(self, tenant_id: str, run_id: str) -> WorkflowSnapshot:

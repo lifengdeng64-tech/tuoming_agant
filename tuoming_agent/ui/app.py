@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from tuoming_agent import __version__
+from tuoming_agent.analysis.errors import AnalysisServiceError
 from tuoming_agent.analysis.naming import GeneratedNameValidationError
 from tuoming_agent.analysis.planner import SafeAnalysisPlanner
 from tuoming_agent.analysis.presentation import describe_plan
@@ -101,9 +102,7 @@ def run() -> None:
     elif selected_view == "结果":
         _render_results_view(services, tenant_id, workspace_id, artifacts)
     else:
-        _render_settings(
-            settings_manager, config, services, tenant_id, workspace_id
-        )
+        _render_settings(settings_manager, config, services, tenant_id, workspace_id)
 
 
 @st.cache_resource(show_spinner=False)
@@ -282,13 +281,10 @@ def _render_settings(
         _render_update_settings(settings_manager, config, services, tenant_id, workspace_id)
 
 
-def _render_network_settings(
-    settings_manager: LocalSettingsManager, config: AppConfig
-) -> None:
+def _render_network_settings(settings_manager: LocalSettingsManager, config: AppConfig) -> None:
     _section_heading("企业网络", "代理与 TLS")
     st.caption(
-        "始终验证 TLS；Tuoming 不提供关闭证书校验的选项。"
-        "代理凭据请配置在 Windows 系统代理中。"
+        "始终验证 TLS；Tuoming 不提供关闭证书校验的选项。代理凭据请配置在 Windows 系统代理中。"
     )
     saved = settings_manager.load_network_settings()
     use_system_proxy = st.checkbox(
@@ -320,9 +316,7 @@ def _render_network_settings(
             st.error(str(exc))
 
 
-def _render_backup_settings(
-    settings_manager: LocalSettingsManager, config: AppConfig
-) -> None:
+def _render_backup_settings(settings_manager: LocalSettingsManager, config: AppConfig) -> None:
     _section_heading("备份与恢复", "可迁移加密备份")
     st.caption(
         "备份包含工作区、脱敏制品和迁移所需凭据；使用独立密码加密。密码不会保存，丢失后无法恢复。"
@@ -434,9 +428,7 @@ def _render_update_settings(
         finally:
             manager.close()
 
-    rollback_manager = UpdateManager(
-        config.app_dir or default_app_dir(), config.network_settings
-    )
+    rollback_manager = UpdateManager(config.app_dir or default_app_dir(), config.network_settings)
     try:
         rollback_candidates = rollback_manager.rollback_candidates()
     finally:
@@ -453,9 +445,7 @@ def _render_update_settings(
             key="rollback-installer",
         )
         if st.button("退出并安装所选版本", key="install-rollback"):
-            manager = UpdateManager(
-                config.app_dir or default_app_dir(), config.network_settings
-            )
+            manager = UpdateManager(config.app_dir or default_app_dir(), config.network_settings)
             try:
                 manager.launch_installer(Path(rollback_by_label[rollback_label]))
                 ((config.app_dir or default_app_dir()) / "shutdown.request").write_text(
@@ -468,8 +458,7 @@ def _render_update_settings(
                 manager.close()
 
     st.caption(
-        "当前版本按 Windows 用户隔离数据与 DPAPI 凭据；企业身份联合与集中 SIEM "
-        "推送需在部署时接入。"
+        "当前版本按 Windows 用户隔离数据与 DPAPI 凭据；企业身份联合与集中 SIEM 推送需在部署时接入。"
     )
     events = services.repository.list_audit_events(tenant_id, workspace_id, 5000)
     audit_lines = "\n".join(
@@ -493,6 +482,7 @@ def _render_update_settings(
         key="download-audit",
         help="审计导出不包含原始行、密钥或解密后的映射值。",
     )
+
 
 def _render_model_settings(settings_manager: LocalSettingsManager, config: AppConfig) -> None:
     _section_heading("模型设置", "本机安全凭据")
@@ -594,9 +584,7 @@ def _render_model_settings_form(
         else:
             try:
                 with st.spinner("正在验证模型连接"):
-                    provider = create_provider(
-                        candidate, candidate_key, config.network_settings
-                    )
+                    provider = create_provider(candidate, candidate_key, config.network_settings)
                     connection = provider.test_connection()
                 st.session_state[f"{prefix}-connection-result"] = {
                     "ok": connection.ok,
@@ -826,19 +814,14 @@ def _render_data_view(
                 )
                 if delete_col.button(
                     "删除工作表",
-                    key=(
-                        f"delete-table-{workspace_id}-"
-                        f"{dataset['dataset_version_id']}"
-                    ),
+                    key=(f"delete-table-{workspace_id}-{dataset['dataset_version_id']}"),
                     use_container_width=True,
                 ):
                     st.session_state[f"pending-table-delete-{workspace_id}"] = dataset[
                         "dataset_version_id"
                     ]
                     st.rerun()
-                _render_dataset_version_deletion(
-                    services, tenant_id, workspace_id, dataset
-                )
+                _render_dataset_version_deletion(services, tenant_id, workspace_id, dataset)
         else:
             _empty_state("暂无数据集", "数据")
     with file_col:
@@ -858,9 +841,7 @@ def _render_data_view(
             st.dataframe(file_table, use_container_width=True, hide_index=True)
             for file_record in files:
                 action_col, delete_col = st.columns([4, 1], vertical_alignment="center")
-                action_col.caption(
-                    f"{file_record['original_name']} · {file_record['sha256'][:10]}"
-                )
+                action_col.caption(f"{file_record['original_name']} · {file_record['sha256'][:10]}")
                 if delete_col.button(
                     "删除",
                     key=f"delete-file-{workspace_id}-{file_record['id']}",
@@ -868,9 +849,7 @@ def _render_data_view(
                 ):
                     st.session_state[f"pending-delete-{workspace_id}"] = file_record["id"]
                     st.rerun()
-                _render_file_deletion(
-                    services, tenant_id, workspace_id, file_record
-                )
+                _render_file_deletion(services, tenant_id, workspace_id, file_record)
         else:
             _empty_state("暂无上传记录", "文件")
 
@@ -886,17 +865,13 @@ def _render_dataset_version_deletion(
     if st.session_state.get(state_key) != dataset_version_id:
         return
     try:
-        impact = services.data_sources.inspect_table(
-            tenant_id, workspace_id, dataset_version_id
-        )
+        impact = services.data_sources.inspect_table(tenant_id, workspace_id, dataset_version_id)
     except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
         st.warning(f"无法检查工作表删除影响：{exc}")
         return
 
     has_dependencies = (
-        impact.analysis_run_count > 0
-        or impact.artifact_count > 1
-        or impact.message_count > 0
+        impact.analysis_run_count > 0 or impact.artifact_count > 1 or impact.message_count > 0
     )
     st.warning(
         f"将删除工作表 {impact.logical_name} V{impact.version}（{impact.row_count:,} 行）、"
@@ -932,8 +907,7 @@ def _render_dataset_version_deletion(
         st.session_state.pop(state_key, None)
         _set_flash(
             "success",
-            f"已删除工作表 {deleted.logical_name} 及 "
-            f"{deleted.artifact_count - 1} 个关联制品。",
+            f"已删除工作表 {deleted.logical_name} 及 {deleted.artifact_count - 1} 个关联制品。",
         )
         st.rerun()
     if st.button(
@@ -954,17 +928,13 @@ def _render_file_deletion(
     if st.session_state.get(state_key) != file_record["id"]:
         return
     try:
-        impact = services.data_sources.inspect(
-            tenant_id, workspace_id, file_record["id"]
-        )
+        impact = services.data_sources.inspect(tenant_id, workspace_id, file_record["id"])
     except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
         st.warning(f"无法检查删除影响：{exc}")
         return
 
     has_dependencies = (
-        impact.analysis_run_count > 0
-        or impact.artifact_count > 1
-        or impact.message_count > 0
+        impact.analysis_run_count > 0 or impact.artifact_count > 1 or impact.message_count > 0
     )
     st.warning(
         f"将删除 {impact.dataset_version_count} 个数据版本、"
@@ -985,9 +955,7 @@ def _render_file_deletion(
         disabled=not acknowledged,
     ):
         try:
-            deleted = services.data_sources.delete(
-                tenant_id, workspace_id, file_record["id"]
-            )
+            deleted = services.data_sources.delete(tenant_id, workspace_id, file_record["id"])
         except (AuthorizationError, RecordNotFoundError, ValueError, OSError) as exc:
             st.warning(f"删除失败，原数据已保留：{exc}")
             return
@@ -1115,6 +1083,14 @@ def _render_analysis_view(
         st.rerun()
     except GeneratedNameValidationError as exc:
         st.error(str(exc))
+    except AnalysisServiceError as exc:
+        services.repository.add_audit_event(
+            tenant_id,
+            "analysis_failed",
+            workspace_id,
+            {"source_artifact_id": source_id, "error_code": exc.error_code},
+        )
+        st.error(exc.public_message)
     except (SensitiveContentError, ValueError) as exc:
         st.error(str(exc))
     except Exception:
@@ -1244,11 +1220,10 @@ def _render_workflow_card(
                         preferred_artifact_id=snapshot.run["source_artifact_id"],
                     )
                     with st.spinner("正在生成新版计划"):
-                        workflow.revise(
-                            tenant_id, snapshot.run["id"], safe_feedback, context
-                        )
+                        workflow.revise(tenant_id, snapshot.run["id"], safe_feedback, context)
                 except (
                     GeneratedNameValidationError,
+                    AnalysisServiceError,
                     SensitiveContentError,
                     ValueError,
                 ) as exc:

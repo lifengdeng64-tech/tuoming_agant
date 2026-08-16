@@ -98,3 +98,76 @@ def test_concurrent_artifacts_use_unique_paths(services, workspace):
     assert all(path.exists() for path in paths)
     assert not list(services.artifacts.artifact_store.root.rglob("*.tmp*"))
 
+
+def test_weighted_revenue_completion_excludes_temporary_closures(services, workspace):
+    source = services.artifacts.save_result(
+        "tenant-a",
+        workspace.id,
+        "营收明细",
+        pd.DataFrame(
+            {
+                "历史营业状态": ["正常营业", "正常营业", "临时停业", "正常营业"],
+                "事业部": ["华东", "华东", "华东", "华南"],
+                "本期营收": [80.0, 30.0, 1000.0, 45.0],
+                "本期目标": [100.0, 50.0, 1000.0, 50.0],
+                "去年同期营收": [60.0, 40.0, 800.0, 40.0],
+                "去年同期目标": [100.0, 50.0, 1000.0, 50.0],
+            }
+        ),
+        {},
+        (),
+    )
+    plan = AnalysisPlan(
+        input_artifact_id=source.id,
+        result_name="事业部营收完成度分析",
+        operations=[
+            {
+                "action": "filter",
+                "column": "历史营业状态",
+                "operator": "ne",
+                "value": "临时停业",
+            },
+            {
+                "action": "groupby",
+                "by": ["事业部"],
+                "aggregations": [
+                    {"column": "本期营收", "function": "sum", "output": "本期营收合计"},
+                    {"column": "本期目标", "function": "sum", "output": "本期目标合计"},
+                    {
+                        "column": "去年同期营收",
+                        "function": "sum",
+                        "output": "去年同期营收合计",
+                    },
+                    {
+                        "column": "去年同期目标",
+                        "function": "sum",
+                        "output": "去年同期目标合计",
+                    },
+                ],
+            },
+            {
+                "action": "derive",
+                "column": "营收完成度",
+                "expression": "col('本期营收合计') / col('本期目标合计')",
+            },
+            {
+                "action": "derive",
+                "column": "去年营收完成度",
+                "expression": "col('去年同期营收合计') / col('去年同期目标合计')",
+            },
+            {
+                "action": "derive",
+                "column": "营收完成度同比",
+                "expression": "col('营收完成度') / col('去年营收完成度') - 1",
+            },
+        ],
+    )
+
+    result = AnalysisExecutor(services.artifacts).execute("tenant-a", workspace.id, plan)
+    _, dataframe = services.artifacts.load("tenant-a", result.id)
+    by_division = dataframe.set_index("事业部")
+
+    assert by_division.loc["华东", "营收完成度"] == pytest.approx(110 / 150)
+    assert by_division.loc["华东", "去年营收完成度"] == pytest.approx(100 / 150)
+    assert by_division.loc["华东", "营收完成度同比"] == pytest.approx(0.1)
+    assert by_division.loc["华南", "营收完成度"] == pytest.approx(0.9)
