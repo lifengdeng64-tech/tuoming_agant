@@ -11,6 +11,8 @@ from langchain_openai import ChatOpenAI
 from tuoming_agent.providers.base import AnalysisModelProvider, ProviderConnectionResult
 from tuoming_agent.settings import PROVIDER_BY_ID, ModelSettings, NetworkSettings
 
+MODEL_REQUEST_TIMEOUT_SECONDS = 120
+
 
 class OpenAIModelProvider:
     def __init__(
@@ -27,7 +29,7 @@ class OpenAIModelProvider:
             model=self.settings.model_name,
             temperature=0,
             max_retries=0,
-            timeout=20,
+            timeout=MODEL_REQUEST_TIMEOUT_SECONDS,
             http_client=_http_client(self.network),
         )
 
@@ -61,7 +63,7 @@ class AnthropicModelProvider:
             model_name=self.settings.model_name,
             temperature=0,
             max_retries=0,
-            timeout=20,
+            timeout=MODEL_REQUEST_TIMEOUT_SECONDS,
             **options,
         )
 
@@ -94,7 +96,7 @@ class GeminiModelProvider:
             model=self.settings.model_name,
             temperature=0,
             retries=0,
-            request_timeout=20,
+            request_timeout=MODEL_REQUEST_TIMEOUT_SECONDS,
             client_options=client_options,
         )
 
@@ -163,6 +165,7 @@ def provider_error_details(exc: Exception, api_key: str = "") -> ProviderErrorDe
     if api_key:
         raw_message = raw_message.replace(api_key, "***")
     message = raw_message.casefold()
+    exception_name = type(exc).__name__.casefold()
     if status_code in {401, 403} or any(
         token in message for token in ("invalid api key", "authentication", "unauthorized")
     ):
@@ -184,6 +187,12 @@ def provider_error_details(exc: Exception, api_key: str = "") -> ProviderErrorDe
     if any(token in message for token in ("proxy", "407")):
         return ProviderErrorDetails(
             "provider_proxy", "企业代理连接失败，请检查 Windows 系统代理或代理地址。"
+        )
+    if "timeout" in exception_name or any(
+        token in message for token in ("timeout", "timed out", "time out")
+    ):
+        return ProviderErrorDetails(
+            "provider_timeout", "模型响应超时，请稍后重试，或切换响应更快的模型。"
         )
     if any(token in message for token in ("connection", "connect", "timeout", "network")):
         return ProviderErrorDetails(
