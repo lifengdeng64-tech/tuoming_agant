@@ -6,6 +6,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 datas = [("app.py", ".")]
 binaries = []
 hiddenimports = []
+hiddenimports += collect_submodules("tuoming_agent")
 for package in (
     "streamlit",
     "duckdb",

@@ -5,6 +5,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_pyinstaller_collects_runtime_loaded_application_package() -> None:
+    spec = (ROOT / "TuomingAgent.spec").read_text(encoding="utf-8")
+
+    assert 'hiddenimports += collect_submodules("tuoming_agent")' in spec
+
+
 def test_prerelease_workflow_publishes_only_portable_assets() -> None:
     workflow = (ROOT / ".github/workflows/release-windows.yml").read_text(encoding="utf-8")
 
@@ -25,3 +31,13 @@ def test_portable_verification_does_not_require_installer() -> None:
         'if (-not $SkipInstaller) { $signedArtifacts += "dist\\TuomingAgent-Setup.exe" }'
         in verifier
     )
+
+
+def test_portable_verification_starts_packaged_ui() -> None:
+    verifier = (ROOT / "scripts/verify_windows_release.ps1").read_text(encoding="utf-8")
+    smoke = (ROOT / "scripts/smoke_test_windows_portable.ps1").read_text(encoding="utf-8")
+
+    assert '& "$PSScriptRoot\\smoke_test_windows_portable.ps1"' in verifier
+    assert '"--streamlit-child", "--port", $port' in smoke
+    assert "_stcore/health" in smoke
+    assert "ModuleNotFoundError" in smoke

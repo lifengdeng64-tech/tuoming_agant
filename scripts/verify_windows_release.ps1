@@ -26,3 +26,4 @@ foreach ($signedArtifact in $signedArtifacts) {
     }
     Write-Host "$signedArtifact signature: $($signature.Status)"
 }
+& "$PSScriptRoot\smoke_test_windows_portable.ps1"

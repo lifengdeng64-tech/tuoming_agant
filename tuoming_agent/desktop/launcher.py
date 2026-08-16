@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import ctypes
+import importlib
 import json
 import os
 import socket
@@ -95,6 +96,7 @@ def _run_desktop(preferred_port: int, *, open_browser: bool) -> None:
 def _run_streamlit_child(port: int) -> None:
     from streamlit.web import bootstrap
 
+    _validate_bundled_runtime()
     app_path = _bundled_app_path()
     options: dict[str, Any] = {
         "global_developmentMode": False,
@@ -108,6 +110,13 @@ def _run_streamlit_child(port: int) -> None:
     }
     bootstrap.load_config_options(options)
     bootstrap.run(str(app_path), False, [], options)
+
+
+def _validate_bundled_runtime() -> None:
+    """Fail before the health endpoint opens when packaged app modules are missing."""
+    ui_module = importlib.import_module("tuoming_agent.ui")
+    if not callable(getattr(ui_module, "run", None)):
+        raise RuntimeError("Tuoming UI 模块不完整，请重新下载安装完整版本。")
 
 
 def _start_streamlit_process(port: int, log_handle: IO[bytes]) -> subprocess.Popen[bytes]:

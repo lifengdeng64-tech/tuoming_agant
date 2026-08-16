@@ -5,6 +5,8 @@ import json
 import socket
 from pathlib import Path
 
+import pytest
+
 from tuoming_agent.desktop import launcher
 
 
@@ -152,3 +154,14 @@ def test_bundled_app_path_points_to_top_level_streamlit_entry() -> None:
     expected = Path(__file__).resolve().parents[1] / "app.py"
 
     assert launcher._bundled_app_path() == expected
+
+
+def test_validate_bundled_runtime_requires_ui_run(monkeypatch) -> None:
+    monkeypatch.setattr(
+        launcher.importlib,
+        "import_module",
+        lambda name: type("IncompleteUi", (), {})(),
+    )
+
+    with pytest.raises(RuntimeError, match="UI 模块不完整"):
+        launcher._validate_bundled_runtime()
