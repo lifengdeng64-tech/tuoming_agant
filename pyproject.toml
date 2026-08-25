@@ -19,6 +19,7 @@ dependencies = [
     "pandas>=2.2",
     "pyarrow>=17.0",
     "pydantic>=2.9,<3",
+    "plotly>=6.0,<7",
     "python-dotenv>=1.0",
     "streamlit>=1.39",
     "xlsxwriter>=3.2",
