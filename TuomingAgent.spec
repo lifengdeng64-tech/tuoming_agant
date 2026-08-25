@@ -9,6 +9,7 @@ hiddenimports = []
 hiddenimports += collect_submodules("tuoming_agent")
 for package in (
     "streamlit",
+    "plotly",
     "duckdb",
     "pyarrow",
     "openpyxl",

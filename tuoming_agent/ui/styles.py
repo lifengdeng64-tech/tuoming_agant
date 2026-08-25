@@ -93,8 +93,13 @@ p, label, [data-testid="stCaptionContainer"] { letter-spacing: 0 !important; }
     .block-container { padding: 1.1rem .85rem 5rem; }
     h1 { font-size: 1.55rem !important; }
     .page-intro h2 { font-size: 1.7rem !important; }
-    [data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
-    [data-testid="column"] { min-width: min(100%, 310px) !important; flex: 1 1 310px !important; }
+    [class*="st-key-dashboard-charts"] [data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap;
+    }
+    [class*="st-key-dashboard-charts"] [data-testid="stColumn"] {
+        min-width: 100% !important;
+        flex: 1 1 100% !important;
+    }
     [data-testid="stMetric"] { min-height: 88px; padding: .75rem .85rem; }
     [data-testid="stMetricValue"] { font-size: 1.25rem; }
     .insight-card { min-height: 112px; }

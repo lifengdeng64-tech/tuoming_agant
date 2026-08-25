@@ -19,6 +19,11 @@ temp_result.csv
 # 忽略虚拟环境（如果你建了的话）
 venv/
 .venv/
+.venv*/
+
+# Local design previews and task scratch data
+.superpowers/
+.tmp-*/
 
 # Windows desktop packaging outputs
 build/

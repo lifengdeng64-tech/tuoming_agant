@@ -126,27 +126,28 @@ def render_dashboard_view(
         measures,
         aggregation,
     )
-    chart_columns = st.columns(2, gap="large")
-    with chart_columns[0]:
-        _render_trend(
-            services,
-            tenant_id,
-            workspace_id,
-            artifact,
-            measures,
-            aggregation,
-            date_column,
-        )
-    with chart_columns[1]:
-        _render_category(
-            services,
-            tenant_id,
-            workspace_id,
-            artifact,
-            measures[0],
-            aggregation,
-            category_column,
-        )
+    with st.container(key=f"dashboard-charts-{workspace_id}"):
+        chart_columns = st.columns(2, gap="large")
+        with chart_columns[0]:
+            _render_trend(
+                services,
+                tenant_id,
+                workspace_id,
+                artifact,
+                measures,
+                aggregation,
+                date_column,
+            )
+        with chart_columns[1]:
+            _render_category(
+                services,
+                tenant_id,
+                workspace_id,
+                artifact,
+                measures[0],
+                aggregation,
+                category_column,
+            )
     _render_detail(services, tenant_id, workspace_id, artifact)
 
 
