@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -18,6 +18,9 @@ from tuoming_agent.security.vault import TokenVault
 from tuoming_agent.storage.files import ArtifactStore, SecureFileStore
 from tuoming_agent.storage.sqlite import SQLiteRepository
 from tuoming_agent.workspace.data_sources import DataSourceService
+
+if TYPE_CHECKING:
+    from tuoming_agent.dashboard.service import DashboardService
 
 
 class ArtifactService:
@@ -283,9 +286,12 @@ class ApplicationServices:
     artifacts: ArtifactService
     conversations: ConversationService
     data_sources: DataSourceService
+    dashboard: DashboardService
 
 
 def create_services(config: AppConfig) -> ApplicationServices:
+    from tuoming_agent.dashboard.service import DashboardService
+
     config.data_dir.mkdir(parents=True, exist_ok=True)
     repository = SQLiteRepository(config.database_path)
     repository.initialize()
@@ -308,4 +314,5 @@ def create_services(config: AppConfig) -> ApplicationServices:
         artifacts=artifacts,
         conversations=ConversationService(repository, sanitizer),
         data_sources=DataSourceService(repository, config.data_dir),
+        dashboard=DashboardService(repository, artifacts, config),
     )
