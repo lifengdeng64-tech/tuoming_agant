@@ -38,11 +38,12 @@ from tuoming_agent.settings import (
     default_app_dir,
 )
 from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
+from tuoming_agent.ui.dashboard import render_dashboard_view
 from tuoming_agent.ui.styles import APP_STYLES
 from tuoming_agent.workspace.data_sources import DataSourceDeletionError
 from tuoming_agent.workspace.service import ApplicationServices, create_services
 
-VIEW_OPTIONS = ("概览", "数据", "分析", "结果", "设置")
+VIEW_OPTIONS = ("概览", "数据", "分析", "仪表盘", "结果", "设置")
 NORMALIZERS = ("text", "casefold", "phone", "identifier")
 
 
@@ -99,6 +100,8 @@ def run() -> None:
             conversation["id"],
             artifacts,
         )
+    elif selected_view == "仪表盘":
+        render_dashboard_view(services, tenant_id, workspace_id, artifacts)
     elif selected_view == "结果":
         _render_results_view(services, tenant_id, workspace_id, artifacts)
     else:
@@ -121,7 +124,7 @@ def _workspace_sidebar(services: ApplicationServices, config: AppConfig, tenant_
         """
         <div class="brand-lockup">
             <div class="brand-mark">T</div>
-            <div><strong>透明数据</strong><span>安全分析工作台</span></div>
+            <div><strong>旅数智析</strong><span>Local Intelligence</span></div>
         </div>
         """,
         unsafe_allow_html=True,
