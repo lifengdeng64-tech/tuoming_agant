@@ -43,7 +43,7 @@ class AppConfig:
     analyst_provider: str = "deepseek"
     analyst_api_key: str | None = None
     analyst_base_url: str | None = None
-    analyst_model_name: str = "deepseek-chat"
+    analyst_model_name: str = "deepseek-v4-pro"
     analysis_max_repair_attempts: int = 3
     duckdb_memory_limit: str = "2GiB"
     duckdb_threads: int = 4
@@ -94,7 +94,7 @@ class AppConfig:
             analyst_provider=os.getenv("ANALYST_PROVIDER", "deepseek"),
             analyst_api_key=os.getenv("ANALYST_API_KEY") or None,
             analyst_base_url=os.getenv("ANALYST_BASE_URL") or None,
-            analyst_model_name=os.getenv("ANALYST_MODEL_NAME", "deepseek-chat"),
+            analyst_model_name=os.getenv("ANALYST_MODEL_NAME", "deepseek-v4-pro"),
             analysis_max_repair_attempts=max_repairs,
             duckdb_memory_limit=memory_limit,
             duckdb_threads=threads,

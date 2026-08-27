@@ -28,7 +28,7 @@ PROVIDERS: tuple[ProviderDefinition, ...] = (
         "deepseek",
         "DeepSeek",
         "https://api.deepseek.com",
-        ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-chat", "deepseek-reasoner"),
+        ("deepseek-v4-pro", "deepseek-v4-flash"),
         "openai_compatible",
     ),
     ProviderDefinition(
@@ -75,6 +75,31 @@ PROVIDERS: tuple[ProviderDefinition, ...] = (
     ),
 )
 PROVIDER_BY_ID = {provider.id: provider for provider in PROVIDERS}
+
+MODEL_DISPLAY_NAMES: dict[tuple[str, str], str] = {
+    ("deepseek", "deepseek-v4-pro"): "DeepSeek-V4-Pro",
+    ("deepseek", "deepseek-v4-flash"): "DeepSeek-V4-Flash",
+    ("openai", "gpt-5.2"): "GPT-5.2",
+    ("openai", "gpt-5-mini"): "GPT-5 mini",
+    ("openai", "gpt-4.1"): "GPT-4.1",
+    ("anthropic", "claude-opus-4-6"): "Claude Opus 4.6",
+    ("anthropic", "claude-sonnet-4-6"): "Claude Sonnet 4.6",
+    ("anthropic", "claude-haiku-4-5"): "Claude Haiku 4.5",
+    ("gemini", "gemini-3.1-pro-preview"): "Gemini 3.1 Pro Preview",
+    ("gemini", "gemini-3-flash-preview"): "Gemini 3 Flash Preview",
+    ("gemini", "gemini-2.5-flash"): "Gemini 2.5 Flash",
+    ("qwen", "qwen3-max"): "Qwen3-Max",
+    ("qwen", "qwen3-coder-plus"): "Qwen3-Coder-Plus",
+    ("qwen", "qwen-plus"): "Qwen-Plus",
+    ("zhipu", "glm-5"): "GLM-5",
+    ("zhipu", "glm-4.7"): "GLM-4.7",
+    ("zhipu", "glm-4.5-air"): "GLM-4.5-Air",
+}
+
+
+def model_display_name(provider_id: str, model_id: str) -> str:
+    """Return the provider's official public model name without changing its API ID."""
+    return MODEL_DISPLAY_NAMES.get((provider_id, model_id), model_id)
 
 
 @dataclass(frozen=True)

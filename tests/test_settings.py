@@ -6,10 +6,12 @@ from pathlib import Path
 
 import pytest
 
+import tuoming_agent.settings as settings_module
 from tuoming_agent.security.credentials import MemorySecretStore, WindowsDpapiSecretStore
 from tuoming_agent.settings import (
     MASTER_KEY_CREDENTIAL,
     MODEL_API_KEY_CREDENTIAL,
+    PROVIDER_BY_ID,
     LocalSettingsManager,
     ModelSettings,
     NetworkSettings,
@@ -135,3 +137,36 @@ def test_network_settings_validate_and_persist_enterprise_ca(tmp_path: Path) -> 
     assert manager.load_network_settings() == NetworkSettings(
         False, "http://proxy.example.test:8080", str(ca_path.resolve())
     )
+
+
+def test_deepseek_picker_uses_current_official_model_names() -> None:
+    provider = PROVIDER_BY_ID["deepseek"]
+    model_display_name = getattr(settings_module, "model_display_name", None)
+
+    assert callable(model_display_name), "模型选择器尚未提供官方名称转换"
+
+    options = [(model_id, model_display_name("deepseek", model_id)) for model_id in provider.models]
+
+    assert options == [
+        ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
+        ("deepseek-v4-flash", "DeepSeek-V4-Flash"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "model_id", "official_name"),
+    [
+        ("openai", "gpt-5.2", "GPT-5.2"),
+        ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6"),
+        ("gemini", "gemini-3.1-pro-preview", "Gemini 3.1 Pro Preview"),
+        ("qwen", "qwen3-max", "Qwen3-Max"),
+        ("zhipu", "glm-5", "GLM-5"),
+    ],
+)
+def test_model_picker_preserves_official_brand_capitalization(
+    provider_id: str, model_id: str, official_name: str
+) -> None:
+    model_display_name = getattr(settings_module, "model_display_name", None)
+
+    assert callable(model_display_name), "模型选择器尚未提供官方名称转换"
+    assert model_display_name(provider_id, model_id) == official_name

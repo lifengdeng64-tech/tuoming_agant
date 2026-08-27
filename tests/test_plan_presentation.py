@@ -43,6 +43,38 @@ def test_describe_plan_includes_local_dashboard_intent():
     assert "“事业部”" in rendered
 
 
+def test_describe_plan_translates_safe_calculations_and_aggregation_to_chinese():
+    plan = AnalysisPlan(
+        input_artifact_id="source-id",
+        result_name="完成率分析",
+        operations=[
+            {
+                "action": "derive",
+                "column": "本期完成率",
+                "expression": "safe_divide(col('本期实际'), col('本期预算'))",
+            },
+            {
+                "action": "derive",
+                "column": "同比差异",
+                "expression": "safe_divide(col('本期完成率'), col('上期完成率')) - 1",
+            },
+        ],
+        dashboard={
+            "measures": ["本期完成率", "同比差异"],
+            "aggregation": "sum",
+            "category_column": "品牌名称",
+        },
+    )
+
+    rendered = "\n".join(describe_plan(plan))
+
+    assert "计算新列“本期完成率”：“本期实际” ÷ “本期预算”（分母为 0 时结果留空）" in rendered
+    assert "计算新列“同比差异”：“本期完成率” ÷ “上期完成率” − 1（分母为 0 时结果留空）" in rendered
+    assert "聚合方式：求和" in rendered
+    assert "safe_divide" not in rendered
+    assert "col(" not in rendered
+
+
 def test_restore_display_value_preserves_non_tokens_and_tenant_boundaries(services):
     tenant_token = services.vault.tokenize("tenant-a", "brand", "华住")
     other_tenant_token = services.vault.tokenize("tenant-b", "brand", "如家")
@@ -61,32 +93,48 @@ def test_restore_display_value_preserves_non_tokens_and_tenant_boundaries(servic
     }
 
 
-def test_describe_plan_restores_only_displayed_filter_and_fill_values(services):
+def test_describe_plan_restores_all_names_and_artifact_labels_only_for_display(services):
     token = services.vault.tokenize("tenant-a", "brand", "华住")
-    protected_token = services.vault.tokenize("tenant-a", "metadata", "不应展示")
+    column_token = services.vault.tokenize("tenant-a", "metadata", "品牌名称")
+    result_token = services.vault.tokenize("tenant-a", "metadata", "品牌完成率分析")
     plan = AnalysisPlan(
-        input_artifact_id=protected_token,
-        result_name=protected_token,
+        input_artifact_id="source-id",
+        result_name=result_token,
         operations=[
-            {"action": "filter", "column": protected_token, "operator": "eq", "value": token},
+            {"action": "filter", "column": column_token, "operator": "eq", "value": token},
             {
                 "action": "fillna",
-                "values": {protected_token: {"preferred": token}, "备注": [token, "未知"]},
+                "values": {column_token: {"preferred": token}, "备注": [token, "未知"]},
             },
-            {"action": "derive", "column": protected_token, "expression": protected_token},
+            {
+                "action": "merge",
+                "right_artifact_id": "budget-id",
+                "left_on": [column_token],
+                "right_on": [column_token],
+            },
         ],
     )
 
     lines = describe_plan(
         plan,
         resolve_value=lambda value: services.masking.restore_display_value("tenant-a", value),
+        resolve_artifact=lambda artifact_id: {
+            "source-id": "酒店营收.xlsx｜本期",
+            "budget-id": "酒店预算.xlsx｜预算表",
+        }.get(artifact_id, artifact_id),
     )
 
     rendered = "\n".join(lines)
+    assert "数据源：酒店营收.xlsx｜本期" in rendered
+    assert "结果名称：品牌完成率分析" in rendered
+    assert "与“酒店预算.xlsx｜预算表”合并" in rendered
+    assert "品牌名称" in rendered
     assert "'华住'" in rendered
     assert token not in rendered
-    assert rendered.count(protected_token) == 6
+    assert column_token not in rendered
+    assert result_token not in rendered
+    assert "source-id" not in rendered
+    assert "budget-id" not in rendered
     assert plan.operations[0].value == token
-    assert plan.operations[1].values[protected_token]["preferred"] == token
-
+    assert plan.operations[1].values[column_token]["preferred"] == token
 

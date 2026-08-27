@@ -454,14 +454,13 @@ def test_security_rejection_never_calls_planner_for_repair(services, workspace):
     )
     planner = QueuePlanner([unsafe, _plan(source.id)])
     workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
-    started = workflow.start("tenant-a", workspace.id, conversation["id"], source.id, "x", {})
-
-    blocked = workflow.confirm("tenant-a", started.run["id"])
+    blocked = workflow.start("tenant-a", workspace.id, conversation["id"], source.id, "x", {})
 
     assert blocked.run["status"] == "security_blocked"
     assert blocked.run["repair_count"] == 0
     assert len(planner.calls) == 1
-    assert blocked.attempts[-1].error_kind == "security"
+    assert blocked.plan_versions == ()
+    assert blocked.attempts == ()
 
 
 def test_repair_limit_stops_replanning(services, workspace):
@@ -612,4 +611,3 @@ def test_planning_failure_persists_only_safe_error_details(services, workspace):
     assert run["error_kind"] == "terminal"
     assert run["error_message"] == "分析计划生成失败，请重试；如持续失败，请检查模型设置。"
     assert leaked_value not in run["error_message"]
-

@@ -40,9 +40,11 @@ Apply row filters before aggregation. For “剔除临时停业”, filter the e
 with operator "ne" and value “临时停业” before grouping.
 For weighted completion, do not average row-level completion percentages. Prefer additive
 numerators and denominators: group by the requested dimensions, sum actual and target values,
-then derive completion = safe_divide(summed actual, summed target). For completion同比, also sum the
+then compute summed actual / summed target with safe_divide(summed actual, summed target).
+For completion同比, also sum the
 prior-period actual and target values, derive prior completion, then derive
-同比 = safe_divide(current completion, prior completion) - 1. If the schema instead provides
+同比 as current completion / prior completion - 1 with
+safe_divide(current completion, prior completion) - 1. If the schema instead provides
 a metric and an explicit weight, derive metric * weight before grouping, sum that contribution
 and the weight, then divide the two sums. Use only columns that actually exist in the supplied
 schema.

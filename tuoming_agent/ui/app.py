@@ -36,6 +36,7 @@ from tuoming_agent.settings import (
     ModelSettings,
     NetworkSettings,
     default_app_dir,
+    model_display_name,
 )
 from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
 from tuoming_agent.ui.dashboard import prime_dashboard_state, render_dashboard_view
@@ -530,6 +531,9 @@ def _render_model_settings_form(
         "模型",
         model_options,
         index=model_options.index(initial_model),
+        format_func=lambda item: (
+            item if item == custom_model_label else model_display_name(provider_id, item)
+        ),
         key=f"{prefix}-model-choice-{provider_id}",
     )
     if model_choice == custom_model_label:
@@ -1141,11 +1145,25 @@ def _render_workflow_card(
         )
 
         if snapshot.plan_versions:
+
+            def resolve_artifact_name(artifact_id: str) -> str:
+                repository = getattr(services, "repository", None)
+                if repository is None:
+                    return artifact_id
+                try:
+                    artifact = repository.get_artifact(tenant_id, artifact_id)
+                except (AuthorizationError, RecordNotFoundError, ValueError):
+                    return artifact_id
+                if artifact.workspace_id != workspace_id:
+                    return artifact_id
+                return artifact.name
+
             for line in describe_plan(
                 snapshot.current_plan.plan,
                 resolve_value=lambda value: services.masking.restore_display_value(
                     tenant_id, value
                 ),
+                resolve_artifact=resolve_artifact_name,
             ):
                 st.markdown(f"- {line}")
             if snapshot.current_plan.reason == "repair" and snapshot.run["error_message"]:
@@ -1618,4 +1636,3 @@ def _render_flash() -> None:
         return
     renderer = getattr(st, flash["level"], st.info)
     renderer(flash["message"])
-
