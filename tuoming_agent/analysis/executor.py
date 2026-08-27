@@ -75,6 +75,20 @@ class AnalysisExecutor:
             candidate.parent_ids,
         )
 
+    def preflight(self, tenant_id: str, workspace_id: str, plan: AnalysisPlan) -> None:
+        """Compile the plan without reading rows or creating an output artifact."""
+        runtime = DuckDBRuntime(self.artifact_service.config)
+        try:
+            runtime.compiler(self.artifact_service.repository).compile(
+                tenant_id, workspace_id, plan
+            )
+        except SecurityPolicyViolation:
+            raise
+        except ValueError:
+            # Schema/business mismatches remain eligible for the existing bounded
+            # execution repair path; only security violations stop before confirmation.
+            return
+
     def prepare(self, tenant_id: str, workspace_id: str, plan: AnalysisPlan) -> AnalysisCandidate:
         runtime = DuckDBRuntime(self.artifact_service.config)
         candidate_path: Path | None = None

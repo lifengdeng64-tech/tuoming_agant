@@ -30,8 +30,19 @@ class DashboardDefaults:
     category_column: str | None
 
 
-_NUMERIC_MARKERS = ("int", "float", "double", "decimal")
+_NUMERIC_MARKERS = ("int", "uint", "float", "double", "decimal")
 _DATE_MARKERS = ("date", "time", "timestamp")
+_DATE_NAME_MARKERS = (
+    "日期",
+    "时间",
+    "月份",
+    "年月",
+    "年度",
+    "date",
+    "time",
+    "month",
+    "year",
+)
 
 
 def infer_dashboard_defaults(artifact: ArtifactRecord) -> DashboardDefaults:
@@ -44,7 +55,10 @@ def infer_dashboard_defaults(artifact: ArtifactRecord) -> DashboardDefaults:
         if not name:
             continue
         dtype = str(column.get("dtype", "")).casefold()
-        if any(marker in dtype for marker in _DATE_MARKERS):
+        if any(marker in dtype for marker in _DATE_MARKERS) or (
+            not any(marker in dtype for marker in _NUMERIC_MARKERS)
+            and any(marker in name.casefold() for marker in _DATE_NAME_MARKERS)
+        ):
             dates.append(name)
         elif any(marker in dtype for marker in _NUMERIC_MARKERS):
             numeric.append(name)

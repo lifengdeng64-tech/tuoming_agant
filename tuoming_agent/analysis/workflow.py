@@ -115,6 +115,7 @@ class AnalysisWorkflowService:
         try:
             plan = self.planner.create_plan(safe_request, safe_context, tenant_id)
             self._assert_selected_source(plan, run)
+            self.executor.preflight(tenant_id, workspace_id, plan)
             self.repository.create_analysis_plan_version(
                 tenant_id, run["id"], plan.model_dump(mode="json"), "initial"
             )
@@ -220,6 +221,9 @@ class AnalysisWorkflowService:
         context["previous_plan"] = snapshot.current_plan.plan.model_dump(mode="json")
         plan = self.planner.create_plan(snapshot.run["safe_request"], context, tenant_id)
         self._assert_selected_source(plan, snapshot.run)
+        self.executor.preflight(
+            tenant_id, snapshot.run["workspace_id"], plan
+        )
         self.repository.decide_analysis_plan_version(
             tenant_id, run_id, snapshot.current_plan.version, "superseded"
         )
@@ -443,6 +447,7 @@ class AnalysisWorkflowService:
         try:
             plan = self.planner.create_plan(run["safe_request"], context, tenant_id)
             self._assert_selected_source(plan, run)
+            self.executor.preflight(tenant_id, run["workspace_id"], plan)
             if self._canonical(plan) == self._canonical(previous_plan):
                 raise ValueError("Repair returned the same plan.")
             self.repository.create_analysis_plan_version(
@@ -497,4 +502,3 @@ class AnalysisWorkflowService:
     def _require_status(snapshot: WorkflowSnapshot, expected: str) -> None:
         if snapshot.run["status"] != expected:
             raise ValueError(f"Analysis run is {snapshot.run['status']}, expected {expected}.")
-

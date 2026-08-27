@@ -597,8 +597,25 @@ class DuckDBCompiler:
                 name = node.args[0].value
                 self._require_columns(columns, [name])
                 return dtypes[name]
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "safe_divide"
+                and len(node.args) == 2
+                and not node.keywords
+            ):
+                numerator_dtype = infer_dtype(node.args[0])
+                denominator_dtype = infer_dtype(node.args[1])
+                if not self._is_numeric_dtype(
+                    numerator_dtype
+                ) or not self._is_numeric_dtype(denominator_dtype):
+                    raise SecurityPolicyViolation(
+                        "safe_divide accepts only numeric expressions."
+                    )
+                return "float64"
             raise SecurityPolicyViolation(
-                "Only numeric constants, arithmetic operators and col('column') are allowed."
+                "Only numeric constants, arithmetic operators, col('column'), and "
+                "safe_divide(numerator, denominator) are allowed."
             )
 
         def compile_node(node: ast.AST) -> tuple[str, str]:
@@ -680,8 +697,31 @@ class DuckDBCompiler:
                 self._require_columns(columns, [node.args[0].value])
                 name = node.args[0].value
                 return self._quote(name), dtypes[name]
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "safe_divide"
+                and len(node.args) == 2
+                and not node.keywords
+            ):
+                numerator_dtype = infer_dtype(node.args[0])
+                denominator_dtype = infer_dtype(node.args[1])
+                if not self._is_numeric_dtype(
+                    numerator_dtype
+                ) or not self._is_numeric_dtype(denominator_dtype):
+                    raise SecurityPolicyViolation(
+                        "safe_divide accepts only numeric expressions."
+                    )
+                numerator, _ = compile_node(node.args[0])
+                denominator, _ = compile_node(node.args[1])
+                return (
+                    f"(CAST({numerator} AS DOUBLE) / "
+                    f"NULLIF(CAST({denominator} AS DOUBLE), 0))",
+                    "float64",
+                )
             raise SecurityPolicyViolation(
-                "Only numeric constants, arithmetic operators and col('column') are allowed."
+                "Only numeric constants, arithmetic operators, col('column'), and "
+                "safe_divide(numerator, denominator) are allowed."
             )
 
         return compile_node(tree.body)

@@ -3,12 +3,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+import pandas as pd
 import streamlit as st
 
 from tuoming_agent.dashboard.charts import ChartDataError, bar_figure, line_figure
 from tuoming_agent.dashboard.models import AggregationName, infer_dashboard_defaults
 from tuoming_agent.dashboard.service import DashboardQueryError, KPIValue
 from tuoming_agent.models import ArtifactRecord
+from tuoming_agent.storage.errors import RecordNotFoundError
 from tuoming_agent.ui.components import render_empty_state, render_kpi_card, render_page_intro
 from tuoming_agent.ui.theme import PLOTLY_CONFIG
 from tuoming_agent.workspace.service import ApplicationServices
@@ -154,15 +156,26 @@ def render_dashboard_view(
     with st.container(key=f"dashboard-charts-{workspace_id}"):
         chart_columns = st.columns(2, gap="large")
         with chart_columns[0]:
-            _render_trend(
-                services,
-                tenant_id,
-                workspace_id,
-                artifact,
-                measures,
-                aggregation,
-                date_column,
-            )
+            if date_column is None and category_column is not None and len(measures) > 1:
+                _render_category(
+                    services,
+                    tenant_id,
+                    workspace_id,
+                    artifact,
+                    measures[1],
+                    aggregation,
+                    category_column,
+                )
+            else:
+                _render_trend(
+                    services,
+                    tenant_id,
+                    workspace_id,
+                    artifact,
+                    measures,
+                    aggregation,
+                    date_column,
+                )
         with chart_columns[1]:
             _render_category(
                 services,
@@ -249,6 +262,13 @@ def _render_trend(
             trend = frames[0]
             for frame in frames[1:]:
                 trend = trend.merge(frame, on=date_column, how="outer")
+            trend = _restore_display_frame(
+                services, tenant_id, artifact, trend, (date_column,)
+            )
+            parsed_dates = _parse_date_dimension(trend[date_column])
+            if parsed_dates.notna().any():
+                trend = trend.loc[parsed_dates.notna()].copy()
+                trend[date_column] = parsed_dates.loc[parsed_dates.notna()]
             trend = trend.sort_values(date_column, kind="stable").tail(200)
             figure = line_figure(
                 trend,
@@ -283,6 +303,9 @@ def _render_category(
                 measure,
                 aggregation,
             )
+            grouped = _restore_display_frame(
+                services, tenant_id, artifact, grouped, (category_column,)
+            )
             figure = bar_figure(
                 grouped.sort_values(measure, kind="stable").tail(20),
                 category_column,
@@ -301,7 +324,7 @@ def _render_detail(
     artifact: ArtifactRecord,
 ) -> None:
     st.markdown("### 数据明细")
-    st.caption("仅展示本地脱敏数据的前 100 行。")
+    st.caption("仅在本机还原并展示前 100 行，原始内容不会上传。")
     try:
         detail = services.dashboard.detail(
             tenant_id, workspace_id, artifact.id, limit=100
@@ -309,10 +332,49 @@ def _render_detail(
     except DashboardQueryError as exc:
         st.warning(f"明细暂时无法读取：{exc}")
         return
+    detail = _restore_display_frame(
+        services, tenant_id, artifact, detail, tuple(artifact.lineage)
+    )
     st.dataframe(detail, width="stretch", hide_index=True, height=360)
+
+
+def _restore_display_frame(
+    services: ApplicationServices,
+    tenant_id: str,
+    artifact: ArtifactRecord,
+    frame: pd.DataFrame,
+    columns: tuple[str, ...],
+) -> pd.DataFrame:
+    lineage = {
+        column: artifact.lineage[column]
+        for column in columns
+        if column in frame.columns and column in artifact.lineage
+    }
+    if not lineage:
+        return frame
+    try:
+        return services.masking.unmask_dataframe(tenant_id, frame, lineage)
+    except RecordNotFoundError:
+        return frame
+
+
+def _parse_date_dimension(series: pd.Series) -> pd.Series:
+    text = series.astype("string").str.strip()
+    normalized = (
+        text.str.replace("年", "-", regex=False)
+        .str.replace("月", "-", regex=False)
+        .str.replace("日", "", regex=False)
+        .str.rstrip("-")
+    )
+    parsed = pd.to_datetime(normalized, errors="coerce")
+    unresolved = parsed.isna() & normalized.str.fullmatch(r"\d{6}", na=False)
+    if unresolved.any():
+        parsed.loc[unresolved] = pd.to_datetime(
+            normalized.loc[unresolved], format="%Y%m", errors="coerce"
+        )
+    return parsed
 
 
 def _artifact_option(artifact: ArtifactRecord) -> str:
     kind = "分析结果" if artifact.kind == "analysis_result" else "上传数据"
     return f"{artifact.name} · {kind} · {artifact.row_count:,} 行"
-

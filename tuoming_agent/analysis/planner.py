@@ -31,17 +31,21 @@ will be rendered locally; never send rows or chart data to the model.
 If the user only asks for a dashboard and no data transformation is needed, operations may
 be empty. Otherwise, express all cleaning and analysis as ordered allowlisted operations.
 Artifact data is already pseudonymized. Use exact artifact IDs and exact schema column names.
-For derive expressions, use only arithmetic and col('column name').
+For derive expressions, use only arithmetic, col('column name'), and
+safe_divide(numerator, denominator). Use safe_divide for completion rates, ratios, and
+year-over-year calculations so a zero denominator returns null. Never emit SQL functions,
+conditionals, comparisons, or Python helpers inside an expression.
 Do not place personal data in result_name or safe_summary.
 Apply row filters before aggregation. For “剔除临时停业”, filter the exact status column
 with operator "ne" and value “临时停业” before grouping.
 For weighted completion, do not average row-level completion percentages. Prefer additive
 numerators and denominators: group by the requested dimensions, sum actual and target values,
-then derive completion = summed actual / summed target. For completion同比, also sum the
+then derive completion = safe_divide(summed actual, summed target). For completion同比, also sum the
 prior-period actual and target values, derive prior completion, then derive
-同比 = current completion / prior completion - 1. If the schema instead provides a metric and
-an explicit weight, derive metric * weight before grouping, sum that contribution and the weight,
-then divide the two sums. Use only columns that actually exist in the supplied schema.
+同比 = safe_divide(current completion, prior completion) - 1. If the schema instead provides
+a metric and an explicit weight, derive metric * weight before grouping, sum that contribution
+and the weight, then divide the two sums. Use only columns that actually exist in the supplied
+schema.
 {GENERATED_NAME_RULE}
 This rule applies only to result_name, aggregation outputs, derive columns, rename targets,
 and merge suffixes. Never translate source column references.
@@ -155,4 +159,3 @@ def _model_generated_values(plan: AnalysisPlan) -> list[Any]:
         elif isinstance(operation, FillnaOperation):
             values.extend(operation.values.values())
     return values
-
