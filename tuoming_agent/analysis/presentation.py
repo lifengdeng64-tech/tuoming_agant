@@ -67,7 +67,7 @@ def _describe(operation: Any, resolve_value: Callable[[Any], Any] | None = None)
 def describe_plan(
     plan: AnalysisPlan, resolve_value: Callable[[Any], Any] | None = None
 ) -> list[str]:
-    return [
+    lines = [
         f"数据源：{plan.input_artifact_id}",
         f"结果名称：{plan.result_name}",
         *[
@@ -75,3 +75,16 @@ def describe_plan(
             for index, operation in enumerate(plan.operations, 1)
         ],
     ]
+    if plan.dashboard is not None:
+        measures = _quoted(plan.dashboard.measures)
+        dimensions = [
+            value
+            for value in (plan.dashboard.date_column, plan.dashboard.category_column)
+            if value
+        ]
+        suffix = f"，维度：{_quoted(dimensions)}" if dimensions else ""
+        lines.append(
+            f"本地生成 BI 仪表盘：指标 {measures}，聚合 {plan.dashboard.aggregation}{suffix}"
+        )
+    return lines
+

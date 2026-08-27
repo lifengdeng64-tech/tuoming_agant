@@ -47,6 +47,31 @@ def format_kpi_value(kpi: KPIValue) -> str:
     return f"{float(value):,.2f}"
 
 
+def prime_dashboard_state(
+    workspace_id: str, artifact: ArtifactRecord, intent: Any
+) -> None:
+    """Apply only schema-valid model preferences to local Streamlit widget state."""
+    defaults = infer_dashboard_defaults(artifact)
+    measures = tuple(
+        column for column in intent.measures if column in defaults.numeric_columns
+    )[:4]
+    st.session_state[f"dashboard-artifact-{workspace_id}"] = artifact.id
+    st.session_state[f"dashboard-measures-{workspace_id}-{artifact.id}"] = (
+        measures or defaults.measure_columns
+    )
+    st.session_state[f"dashboard-aggregation-{workspace_id}-{artifact.id}"] = (
+        intent.aggregation
+    )
+    st.session_state[f"dashboard-date-{workspace_id}-{artifact.id}"] = (
+        intent.date_column if intent.date_column in defaults.date_columns else defaults.date_column
+    )
+    st.session_state[f"dashboard-category-{workspace_id}-{artifact.id}"] = (
+        intent.category_column
+        if intent.category_column in defaults.category_columns
+        else defaults.category_column
+    )
+
+
 def render_dashboard_view(
     services: ApplicationServices,
     tenant_id: str,
@@ -290,3 +315,4 @@ def _render_detail(
 def _artifact_option(artifact: ArtifactRecord) -> str:
     kind = "分析结果" if artifact.kind == "analysis_result" else "上传数据"
     return f"{artifact.name} · {kind} · {artifact.row_count:,} 行"
+

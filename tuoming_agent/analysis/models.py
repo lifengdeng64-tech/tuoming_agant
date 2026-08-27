@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -111,9 +111,26 @@ Operation = Annotated[
 ]
 
 
+class DashboardIntent(StrictModel):
+    """A bounded BI view that is rendered locally after an approved plan completes."""
+
+    measures: list[str] = Field(min_length=1, max_length=4)
+    aggregation: Literal["sum", "mean", "min", "max", "count"] = "sum"
+    date_column: str | None = None
+    category_column: str | None = None
+
+
 class AnalysisPlan(StrictModel):
     input_artifact_id: str
-    operations: list[Operation] = Field(min_length=1, max_length=50)
+    operations: list[Operation] = Field(default_factory=list, max_length=50)
     result_name: str = Field(default="分析结果", min_length=1, max_length=120)
     safe_summary: str = Field(default="处理完成", max_length=1000)
+    dashboard: DashboardIntent | None = None
+
+    @model_validator(mode="after")
+    def require_local_action(self) -> AnalysisPlan:
+        if not self.operations and self.dashboard is None:
+            raise ValueError("A plan must contain operations or a dashboard intent.")
+        return self
+
 

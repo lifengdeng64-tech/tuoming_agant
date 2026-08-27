@@ -23,6 +23,13 @@ Return only valid JSON matching AnalysisPlan.
 You never write or execute Python, SQL, shell commands, imports, filesystem calls, or network calls.
 Use only these approved actions: select, filter, sort, rename, cast, fillna, dropna,
 deduplicate, merge, groupby, derive, head, tail.
+When the user asks for a chart, dashboard, BI board, trend, comparison, or KPI, populate
+the optional dashboard object. Dashboard measures must contain one to four exact numeric
+output column names; aggregation is sum, mean, min, max, or count; date_column and
+category_column must be exact output column names or null. All charts and aggregations
+will be rendered locally; never send rows or chart data to the model.
+If the user only asks for a dashboard and no data transformation is needed, operations may
+be empty. Otherwise, express all cleaning and analysis as ordered allowlisted operations.
 Artifact data is already pseudonymized. Use exact artifact IDs and exact schema column names.
 For derive expressions, use only arithmetic and col('column name').
 Do not place personal data in result_name or safe_summary.
@@ -41,7 +48,7 @@ and merge suffixes. Never translate source column references.
 Valid generated-name examples: “品牌营收分析”, “本期营收”, and “营收同比2026”.
 Example JSON shape:
 {{"input_artifact_id":"exact-id","operations":[{{"action":"head","rows":10}}],
-"result_name":"数据预览","safe_summary":"Prepared a local preview"}}.
+"result_name":"数据预览","safe_summary":"Prepared a local preview","dashboard":null}}.
 """
 
 
@@ -148,3 +155,4 @@ def _model_generated_values(plan: AnalysisPlan) -> list[Any]:
         elif isinstance(operation, FillnaOperation):
             values.extend(operation.values.values())
     return values
+

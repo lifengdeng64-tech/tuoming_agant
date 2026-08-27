@@ -73,6 +73,7 @@ def test_streamlit_child_loads_cli_style_options_before_start(monkeypatch, tmp_p
             "server_enableCORS": True,
             "server_enableXsrfProtection": True,
             "browser_gatherUsageStats": False,
+            "client_toolbarMode": "viewer",
         }
     ]
     assert started == [(str(app_path), False, [], loaded[0])]
@@ -165,3 +166,4 @@ def test_validate_bundled_runtime_requires_ui_run(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="UI 模块不完整"):
         launcher._validate_bundled_runtime()
+

@@ -1385,6 +1385,86 @@ class SQLiteRepository:
                 self._raise_scoped(connection, "conversations", conversation_id, tenant_id)
         return dict(row)
 
+    def delete_conversation(
+        self, tenant_id: str, workspace_id: str, conversation_id: str
+    ) -> dict[str, int]:
+        """Delete one tenant-scoped conversation and its workflow history atomically."""
+        self.get_workspace(tenant_id, workspace_id)
+        with self._connect() as connection:
+            conversation = connection.execute(
+                "SELECT * FROM conversations WHERE id = ? AND tenant_id = ?",
+                (conversation_id, tenant_id),
+            ).fetchone()
+            if conversation is None:
+                self._raise_scoped(connection, "conversations", conversation_id, tenant_id)
+            if conversation["workspace_id"] != workspace_id:
+                raise AuthorizationError("Conversation is outside the selected workspace.")
+
+            message_count = connection.execute(
+                """SELECT COUNT(*) FROM messages
+                WHERE tenant_id = ? AND conversation_id = ?""",
+                (tenant_id, conversation_id),
+            ).fetchone()[0]
+            run_count = connection.execute(
+                """SELECT COUNT(*) FROM analysis_runs
+                WHERE tenant_id = ? AND conversation_id = ?""",
+                (tenant_id, conversation_id),
+            ).fetchone()[0]
+
+            scope_params = (tenant_id, conversation_id)
+            connection.execute(
+                """DELETE FROM analysis_run_messages WHERE run_id IN (
+                    SELECT id FROM analysis_runs
+                    WHERE tenant_id = ? AND conversation_id = ?
+                )""",
+                scope_params,
+            )
+            connection.execute(
+                """DELETE FROM analysis_attempts WHERE run_id IN (
+                    SELECT id FROM analysis_runs
+                    WHERE tenant_id = ? AND conversation_id = ?
+                )""",
+                scope_params,
+            )
+            connection.execute(
+                """DELETE FROM analysis_plan_versions WHERE run_id IN (
+                    SELECT id FROM analysis_runs
+                    WHERE tenant_id = ? AND conversation_id = ?
+                )""",
+                scope_params,
+            )
+            connection.execute(
+                """DELETE FROM analysis_runs
+                WHERE tenant_id = ? AND conversation_id = ?""",
+                scope_params,
+            )
+            connection.execute(
+                """DELETE FROM messages
+                WHERE tenant_id = ? AND conversation_id = ?""",
+                scope_params,
+            )
+            connection.execute(
+                "DELETE FROM conversations WHERE id = ? AND tenant_id = ?",
+                (conversation_id, tenant_id),
+            )
+            connection.execute(
+                """INSERT INTO audit_events(
+                    id, tenant_id, workspace_id, event_type, details_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    str(uuid.uuid4()),
+                    tenant_id,
+                    workspace_id,
+                    "conversation_deleted",
+                    json.dumps(
+                        {"message_count": message_count, "analysis_run_count": run_count},
+                        ensure_ascii=True,
+                    ),
+                    utc_now(),
+                ),
+            )
+        return {"message_count": message_count, "analysis_run_count": run_count}
+
     def update_conversation_summary(
         self, tenant_id: str, conversation_id: str, safe_summary: str
     ) -> None:
@@ -1882,3 +1962,4 @@ class SQLiteRepository:
         if row and row["tenant_id"] != tenant_id:
             raise AuthorizationError("Record belongs to another tenant.")
         raise RecordNotFoundError("Record not found.")
+

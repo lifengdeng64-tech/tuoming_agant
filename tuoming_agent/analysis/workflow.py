@@ -4,8 +4,22 @@ import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from tuoming_agent.analysis.errors import AnalysisServiceError, SecurityPolicyViolation
-from tuoming_agent.analysis.executor import AnalysisExecutionError, AnalysisExecutor
+from tuoming_agent.analysis.errors import (
+    EXECUTION_FAILED_MESSAGE,
+    QUALITY_FAILED_MESSAGE,
+    REPAIR_FAILED_MESSAGE,
+    RESOURCE_LIMIT_MESSAGE,
+    SECURITY_BLOCKED_MESSAGE,
+    TERMINAL_FAILED_MESSAGE,
+    VALIDATION_FAILED_MESSAGE,
+    AnalysisServiceError,
+    SecurityPolicyViolation,
+)
+from tuoming_agent.analysis.executor import (
+    AnalysisExecutionError,
+    AnalysisExecutor,
+    AnalysisResourceError,
+)
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.naming import GeneratedNameValidationError
 from tuoming_agent.analysis.quality import AnalysisQualityValidator, QualityReport
@@ -110,23 +124,23 @@ class AnalysisWorkflowService:
                 expected_status="planning",
                 status="awaiting_confirmation",
             )
-        except SecurityPolicyViolation as exc:
+        except SecurityPolicyViolation:
             self.repository.update_analysis_run(
                 tenant_id,
                 run["id"],
                 expected_status="planning",
                 status="security_blocked",
                 error_kind="security",
-                error_message=str(exc),
+                error_message=SECURITY_BLOCKED_MESSAGE,
             )
-        except (GeneratedNameValidationError, SensitiveContentError) as exc:
+        except (GeneratedNameValidationError, SensitiveContentError):
             self.repository.update_analysis_run(
                 tenant_id,
                 run["id"],
                 expected_status="planning",
                 status="failed",
                 error_kind="validation",
-                error_message=str(exc),
+                error_message=VALIDATION_FAILED_MESSAGE,
             )
             raise
         except AnalysisServiceError as exc:
@@ -248,6 +262,28 @@ class AnalysisWorkflowService:
 
         try:
             self._assert_selected_source(plan_version.plan, snapshot.run)
+            if not plan_version.plan.operations:
+                artifact = self.repository.get_artifact(
+                    tenant_id, plan_version.plan.input_artifact_id
+                )
+                if artifact.workspace_id != snapshot.run["workspace_id"]:
+                    raise SecurityPolicyViolation("Dashboard source is outside the workspace.")
+                self.repository.finish_analysis_attempt(
+                    tenant_id,
+                    attempt["id"],
+                    status="completed",
+                    result_artifact_id=artifact.id,
+                )
+                self.repository.update_analysis_run(
+                    tenant_id,
+                    run_id,
+                    expected_status="executing",
+                    status="completed",
+                    result_artifact_id=artifact.id,
+                    error_kind=None,
+                    error_message=None,
+                )
+                return self.get_snapshot(tenant_id, run_id)
             candidate = self.executor.prepare(
                 tenant_id, snapshot.run["workspace_id"], plan_version.plan
             )
@@ -256,16 +292,21 @@ class AnalysisWorkflowService:
             )
             report = self.validator.validate(candidate)
             if not report.passed:
-                message = "; ".join(item.message for item in report.failures)
                 self.repository.finish_analysis_attempt(
                     tenant_id,
                     attempt["id"],
                     status="failed",
                     quality=report.to_dict(),
                     error_kind="repairable",
-                    error_message=message,
+                    error_message=QUALITY_FAILED_MESSAGE,
                 )
-                return self._repair(tenant_id, run_id, message, plan_version.plan)
+                return self._repair(
+                    tenant_id,
+                    run_id,
+                    "quality_validation_failed",
+                    QUALITY_FAILED_MESSAGE,
+                    plan_version.plan,
+                )
 
             artifact = self.artifact_service.publish_candidate(
                 tenant_id, snapshot.run["workspace_id"], candidate
@@ -286,13 +327,13 @@ class AnalysisWorkflowService:
                 error_kind=None,
                 error_message=None,
             )
-        except (SecurityPolicyViolation, AuthorizationError) as exc:
+        except (SecurityPolicyViolation, AuthorizationError):
             self.repository.finish_analysis_attempt(
                 tenant_id,
                 attempt["id"],
                 status="blocked",
                 error_kind="security",
-                error_message=str(exc),
+                error_message=SECURITY_BLOCKED_MESSAGE,
             )
             self.repository.update_analysis_run(
                 tenant_id,
@@ -300,24 +341,30 @@ class AnalysisWorkflowService:
                 expected_status=("executing", "validating"),
                 status="security_blocked",
                 error_kind="security",
-                error_message=str(exc),
+                error_message=SECURITY_BLOCKED_MESSAGE,
             )
-        except AnalysisExecutionError as exc:
+        except AnalysisExecutionError:
             self.repository.finish_analysis_attempt(
                 tenant_id,
                 attempt["id"],
                 status="failed",
                 error_kind="repairable",
-                error_message=str(exc),
+                error_message=EXECUTION_FAILED_MESSAGE,
             )
-            return self._repair(tenant_id, run_id, str(exc), plan_version.plan)
-        except Exception as exc:
+            return self._repair(
+                tenant_id,
+                run_id,
+                "local_execution_failed",
+                EXECUTION_FAILED_MESSAGE,
+                plan_version.plan,
+            )
+        except AnalysisResourceError:
             self.repository.finish_analysis_attempt(
                 tenant_id,
                 attempt["id"],
                 status="failed",
                 error_kind="terminal",
-                error_message=str(exc),
+                error_message=RESOURCE_LIMIT_MESSAGE,
             )
             self.repository.update_analysis_run(
                 tenant_id,
@@ -325,7 +372,23 @@ class AnalysisWorkflowService:
                 expected_status=("executing", "validating"),
                 status="failed",
                 error_kind="terminal",
-                error_message=str(exc),
+                error_message=RESOURCE_LIMIT_MESSAGE,
+            )
+        except Exception:
+            self.repository.finish_analysis_attempt(
+                tenant_id,
+                attempt["id"],
+                status="failed",
+                error_kind="terminal",
+                error_message=TERMINAL_FAILED_MESSAGE,
+            )
+            self.repository.update_analysis_run(
+                tenant_id,
+                run_id,
+                expected_status=("executing", "validating"),
+                status="failed",
+                error_kind="terminal",
+                error_message=TERMINAL_FAILED_MESSAGE,
             )
         finally:
             if candidate is not None:
@@ -333,7 +396,12 @@ class AnalysisWorkflowService:
         return self.get_snapshot(tenant_id, run_id)
 
     def _repair(
-        self, tenant_id: str, run_id: str, failure: str, previous_plan: AnalysisPlan
+        self,
+        tenant_id: str,
+        run_id: str,
+        failure_code: str,
+        public_message: str,
+        previous_plan: AnalysisPlan,
     ) -> WorkflowSnapshot:
         run = self.repository.get_analysis_run(tenant_id, run_id)
         self.repository.update_analysis_run(
@@ -342,7 +410,7 @@ class AnalysisWorkflowService:
             expected_status=("executing", "validating"),
             status="repairable_error",
             error_kind="repairable",
-            error_message=failure,
+            error_message=public_message,
         )
         if run["repair_count"] >= run["max_repairs"]:
             self.repository.update_analysis_run(
@@ -351,7 +419,7 @@ class AnalysisWorkflowService:
                 expected_status="repairable_error",
                 status="failed",
                 error_kind="repairable",
-                error_message=failure,
+                error_message=public_message,
             )
             return self.get_snapshot(tenant_id, run_id)
 
@@ -361,13 +429,16 @@ class AnalysisWorkflowService:
             expected_status="repairable_error",
             status="repairing",
             error_kind="repairable",
-            error_message=failure,
+            error_message=public_message,
         )
         context = dict(run["context"])
         context["repair"] = {
-            "failure": failure,
+            "failure_code": failure_code,
             "previous_plan": previous_plan.model_dump(mode="json"),
-            "rule": "Return a corrected allowlisted plan; it will require user confirmation.",
+            "rule": (
+                "Return a different corrected allowlisted plan. Do not infer or request raw "
+                "failure details. The corrected plan will require user confirmation."
+            ),
         }
         try:
             plan = self.planner.create_plan(run["safe_request"], context, tenant_id)
@@ -375,7 +446,7 @@ class AnalysisWorkflowService:
             if self._canonical(plan) == self._canonical(previous_plan):
                 raise ValueError("Repair returned the same plan.")
             self.repository.create_analysis_plan_version(
-                tenant_id, run_id, plan.model_dump(mode="json"), "repair", failure
+                tenant_id, run_id, plan.model_dump(mode="json"), "repair", public_message
             )
             self.repository.update_analysis_run(
                 tenant_id,
@@ -384,23 +455,32 @@ class AnalysisWorkflowService:
                 status="awaiting_confirmation",
                 repair_count=run["repair_count"] + 1,
             )
-        except SecurityPolicyViolation as exc:
+        except SecurityPolicyViolation:
             self.repository.update_analysis_run(
                 tenant_id,
                 run_id,
                 expected_status="repairing",
                 status="security_blocked",
                 error_kind="security",
-                error_message=str(exc),
+                error_message=SECURITY_BLOCKED_MESSAGE,
             )
-        except Exception as exc:
+        except AnalysisServiceError as exc:
+            self.repository.update_analysis_run(
+                tenant_id,
+                run_id,
+                expected_status="repairing",
+                status="failed",
+                error_kind=exc.error_code,
+                error_message=exc.public_message,
+            )
+        except Exception:
             self.repository.update_analysis_run(
                 tenant_id,
                 run_id,
                 expected_status="repairing",
                 status="failed",
                 error_kind="terminal",
-                error_message=str(exc),
+                error_message=REPAIR_FAILED_MESSAGE,
             )
         return self.get_snapshot(tenant_id, run_id)
 
@@ -417,3 +497,4 @@ class AnalysisWorkflowService:
     def _require_status(snapshot: WorkflowSnapshot, expected: str) -> None:
         if snapshot.run["status"] != expected:
             raise ValueError(f"Analysis run is {snapshot.run['status']}, expected {expected}.")
+

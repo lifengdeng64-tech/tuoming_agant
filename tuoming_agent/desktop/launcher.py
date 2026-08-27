@@ -107,6 +107,7 @@ def _run_streamlit_child(port: int) -> None:
         "server_enableCORS": True,
         "server_enableXsrfProtection": True,
         "browser_gatherUsageStats": False,
+        "client_toolbarMode": "viewer",
     }
     bootstrap.load_config_options(options)
     bootstrap.run(str(app_path), False, [], options)
@@ -315,3 +316,4 @@ def _show_message(message: str, *, error: bool) -> None:
 
 if __name__ == "__main__":
     main()
+

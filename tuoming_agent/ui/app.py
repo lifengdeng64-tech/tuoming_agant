@@ -38,7 +38,7 @@ from tuoming_agent.settings import (
     default_app_dir,
 )
 from tuoming_agent.storage.errors import AuthorizationError, RecordNotFoundError
-from tuoming_agent.ui.dashboard import render_dashboard_view
+from tuoming_agent.ui.dashboard import prime_dashboard_state, render_dashboard_view
 from tuoming_agent.ui.styles import APP_STYLES
 from tuoming_agent.workspace.data_sources import DataSourceDeletionError
 from tuoming_agent.workspace.service import ApplicationServices, create_services
@@ -985,6 +985,9 @@ def _render_analysis_view(
     artifacts: list[Any],
 ) -> None:
     _section_heading("安全分析", "结构化计划 · 本地执行")
+    _render_conversation_deletion(
+        services, tenant_id, workspace_id, conversation_id
+    )
     if not artifacts:
         _empty_state("请先添加数据制品", "分析")
         return
@@ -1181,15 +1184,22 @@ def _render_workflow_card(
                     result = workflow.confirm(tenant_id, snapshot.run["id"])
                 if result.run["status"] == "completed":
                     artifact_id = result.run["result_artifact_id"]
+                    plan = result.current_plan.plan
                     services.conversations.add_assistant_message(
                         tenant_id,
                         conversation_id,
-                        result.current_plan.plan.safe_summary,
+                        plan.safe_summary,
                         artifact_id,
                         analysis_run_id=result.run["id"],
                     )
                     st.session_state[f"result-selected-{workspace_id}"] = artifact_id
-                    _set_flash("success", f"分析完成，已生成制品 {artifact_id[:8]}。")
+                    if plan.dashboard is not None:
+                        artifact = services.repository.get_artifact(tenant_id, artifact_id)
+                        prime_dashboard_state(workspace_id, artifact, plan.dashboard)
+                        st.query_params["view"] = "仪表盘"
+                        _set_flash("success", "分析完成，已生成本地 BI 仪表盘。")
+                    else:
+                        _set_flash("success", f"分析完成，已生成制品 {artifact_id[:8]}。")
                 elif result.run["status"] == "awaiting_confirmation":
                     _set_flash("error", "执行未通过，已生成修复计划，请重新确认。")
                 elif result.run["status"] == "security_blocked":
@@ -1247,6 +1257,61 @@ def _render_workflow_card(
             st.error(snapshot.run["error_message"] or "分析运行失败。")
         elif status == "rejected":
             st.info("计划已由用户拒绝，未执行。")
+
+
+def _render_conversation_deletion(
+    services: ApplicationServices,
+    tenant_id: str,
+    workspace_id: str,
+    conversation_id: str,
+) -> None:
+    state_key = f"confirm-delete-conversation-{conversation_id}"
+    with st.expander("对话记录管理"):
+        if not st.session_state.get(state_key):
+            if st.button(
+                "删除当前对话记录",
+                key=f"delete-conversation-{conversation_id}",
+                icon=":material/delete:",
+            ):
+                st.session_state[state_key] = True
+                st.rerun()
+            st.caption("只删除当前对话、关联计划和执行历史，不删除上传数据或分析结果。")
+            return
+
+        st.warning("当前对话、关联计划和执行历史将永久删除，数据制品会保留。")
+        acknowledged = st.checkbox(
+            "我确认删除当前对话记录",
+            key=f"ack-delete-conversation-{conversation_id}",
+        )
+        confirm_col, cancel_col = st.columns(2)
+        if confirm_col.button(
+            "确认删除",
+            type="primary",
+            disabled=not acknowledged,
+            key=f"confirm-conversation-delete-{conversation_id}",
+            use_container_width=True,
+        ):
+            try:
+                deleted = services.conversations.delete(
+                    tenant_id, workspace_id, conversation_id
+                )
+            except (AuthorizationError, RecordNotFoundError, ValueError):
+                st.error("删除失败，当前对话记录已完整保留。")
+                return
+            st.session_state.pop(state_key, None)
+            _set_flash(
+                "success",
+                f"已删除 {deleted['message_count']} 条消息和 "
+                f"{deleted['analysis_run_count']} 个关联分析记录。",
+            )
+            st.rerun()
+        if cancel_col.button(
+            "取消",
+            key=f"cancel-conversation-delete-{conversation_id}",
+            use_container_width=True,
+        ):
+            st.session_state.pop(state_key, None)
+            st.rerun()
 
 
 def _render_results_view(
@@ -1553,3 +1618,4 @@ def _render_flash() -> None:
         return
     renderer = getattr(st, flash["level"], st.info)
     renderer(flash["message"])
+

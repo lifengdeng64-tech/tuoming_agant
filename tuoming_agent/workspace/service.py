@@ -225,6 +225,11 @@ class ConversationService:
         )
         self._roll_up_summary(tenant_id, conversation_id)
 
+    def delete(
+        self, tenant_id: str, workspace_id: str, conversation_id: str
+    ) -> dict[str, int]:
+        return self.repository.delete_conversation(tenant_id, workspace_id, conversation_id)
+
     def build_safe_context(
         self,
         tenant_id: str,
@@ -316,3 +321,4 @@ def create_services(config: AppConfig) -> ApplicationServices:
         data_sources=DataSourceService(repository, config.data_dir),
         dashboard=DashboardService(repository, artifacts, config),
     )
+

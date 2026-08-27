@@ -3,8 +3,13 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from tuoming_agent.analysis.errors import AnalysisServiceError
-from tuoming_agent.analysis.executor import AnalysisResourceError
+from tuoming_agent.analysis.errors import (
+    EXECUTION_FAILED_MESSAGE,
+    RESOURCE_LIMIT_MESSAGE,
+    TERMINAL_FAILED_MESSAGE,
+    AnalysisServiceError,
+)
+from tuoming_agent.analysis.executor import AnalysisExecutionError, AnalysisResourceError
 from tuoming_agent.analysis.models import AnalysisPlan
 from tuoming_agent.analysis.naming import GeneratedNameValidationError
 from tuoming_agent.analysis.planner import SafeAnalysisPlanner
@@ -380,6 +385,60 @@ def test_business_error_creates_repair_plan_but_never_executes_without_confirmat
     assert completed.run["status"] == "completed"
 
 
+def test_repair_uses_only_safe_failure_code_and_never_persists_exception_text(
+    services, workspace, monkeypatch
+):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    planner = QueuePlanner([_plan(source.id), _plan(source.id, "store")])
+    workflow = AnalysisWorkflowService(services.repository, services.artifacts, planner)
+    started = workflow.start("tenant-a", workspace.id, conversation["id"], source.id, "x", {})
+    leaked = "SELECT secret FROM C:\\private\\raw.xlsx WHERE guest='张三'"
+
+    monkeypatch.setattr(
+        workflow.executor,
+        "prepare",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AnalysisExecutionError(leaked)),
+    )
+    repaired = workflow.confirm("tenant-a", started.run["id"])
+
+    assert repaired.run["status"] == "awaiting_confirmation"
+    assert repaired.run["error_message"] == EXECUTION_FAILED_MESSAGE
+    assert repaired.attempts[-1].error_message == EXECUTION_FAILED_MESSAGE
+    assert repaired.current_plan.feedback == EXECUTION_FAILED_MESSAGE
+    repair_context = planner.calls[-1][1]["repair"]
+    assert repair_context["failure_code"] == "local_execution_failed"
+    assert "failure" not in repair_context
+    assert leaked not in repr(repaired.run)
+    assert leaked not in repr(repaired.attempts)
+    assert leaked not in repr(planner.calls[-1])
+
+
+def test_dashboard_only_plan_reuses_source_without_copying_data(services, workspace, monkeypatch):
+    source = _source(services, workspace)
+    conversation = _conversation(services, workspace)
+    plan = AnalysisPlan(
+        input_artifact_id=source.id,
+        operations=[],
+        dashboard={"measures": ["sales"], "category_column": "store"},
+    )
+    workflow = AnalysisWorkflowService(
+        services.repository, services.artifacts, QueuePlanner([plan])
+    )
+    started = workflow.start("tenant-a", workspace.id, conversation["id"], source.id, "x", {})
+    monkeypatch.setattr(
+        workflow.executor,
+        "prepare",
+        lambda *_args, **_kwargs: pytest.fail("dashboard-only plans must not duplicate data"),
+    )
+
+    finished = workflow.confirm("tenant-a", started.run["id"])
+
+    assert finished.run["status"] == "completed"
+    assert finished.run["result_artifact_id"] == source.id
+    assert len(services.repository.list_artifacts("tenant-a", workspace.id)) == 1
+
+
 def test_security_rejection_never_calls_planner_for_repair(services, workspace):
     source = _source(services, workspace)
     conversation = _conversation(services, workspace)
@@ -468,6 +527,7 @@ def test_unexpected_execution_error_is_terminal_and_does_not_repair(
 
     assert failed.run["status"] == "failed"
     assert failed.run["error_kind"] == "terminal"
+    assert failed.run["error_message"] == TERMINAL_FAILED_MESSAGE
     assert failed.attempts[-1].error_kind == "terminal"
     assert len(planner.calls) == 1
 
@@ -515,7 +575,7 @@ def test_resource_limit_error_is_actionable_terminal_and_never_repaired(
 
     assert failed.run["status"] == "failed"
     assert failed.run["error_kind"] == "terminal"
-    assert "reduce input size" in failed.run["error_message"]
+    assert failed.run["error_message"] == RESOURCE_LIMIT_MESSAGE
     assert failed.attempts[-1].error_kind == "terminal"
     assert len(planner.calls) == 1
 
@@ -552,3 +612,4 @@ def test_planning_failure_persists_only_safe_error_details(services, workspace):
     assert run["error_kind"] == "terminal"
     assert run["error_message"] == "分析计划生成失败，请重试；如持续失败，请检查模型设置。"
     assert leaked_value not in run["error_message"]
+

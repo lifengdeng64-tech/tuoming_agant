@@ -23,6 +23,26 @@ def test_describe_plan_returns_readable_chinese_instead_of_json():
     assert not any("{\"" in line for line in preview)
 
 
+def test_describe_plan_includes_local_dashboard_intent():
+    plan = AnalysisPlan(
+        input_artifact_id="artifact-12345678",
+        operations=[],
+        result_name="经营看板",
+        dashboard={
+            "measures": ["营收", "完成率"],
+            "aggregation": "sum",
+            "date_column": "月份",
+            "category_column": "事业部",
+        },
+    )
+
+    rendered = "\n".join(describe_plan(plan))
+
+    assert "本地生成 BI 仪表盘" in rendered
+    assert "“营收”" in rendered
+    assert "“事业部”" in rendered
+
+
 def test_restore_display_value_preserves_non_tokens_and_tenant_boundaries(services):
     tenant_token = services.vault.tokenize("tenant-a", "brand", "华住")
     other_tenant_token = services.vault.tokenize("tenant-b", "brand", "如家")
@@ -68,4 +88,5 @@ def test_describe_plan_restores_only_displayed_filter_and_fill_values(services):
     assert rendered.count(protected_token) == 6
     assert plan.operations[0].value == token
     assert plan.operations[1].values[protected_token]["preferred"] == token
+
 
