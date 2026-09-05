@@ -80,6 +80,15 @@ p, label, [data-testid="stCaptionContainer"] { letter-spacing: 0 !important; }
 .insight-card span { color: var(--muted); font-size: .78rem; }
 .insight-card strong { color: var(--ink); font-size: 1.65rem; letter-spacing: -.04em; margin: .4rem 0 .28rem; }
 .insight-card small { color: var(--blue); font-size: .72rem; }
+.dashboard-hero { display: flex; align-items: center; justify-content: space-between; gap: 1.4rem; margin: .25rem 0 1.1rem; padding: 1.35rem 1.5rem; border: 1px solid rgba(0,113,227,.12); border-radius: 22px; background: radial-gradient(circle at 92% 15%, rgba(90,200,250,.18), transparent 31%), linear-gradient(135deg, rgba(255,255,255,.96), rgba(234,244,255,.88)); box-shadow: var(--shadow); }
+.dashboard-hero span { color: var(--blue); font-size: .68rem; font-weight: 760; letter-spacing: .12em !important; }
+.dashboard-hero h3 { margin: .28rem 0 .32rem; font-size: 1.18rem !important; }
+.dashboard-hero p { margin: 0; color: var(--muted); font-size: .84rem; }
+.dashboard-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .45rem; }
+.dashboard-badges b, .chart-kind { display: inline-flex; align-items: center; width: fit-content; color: #0064cf; background: rgba(0,113,227,.085); border: 1px solid rgba(0,113,227,.1); border-radius: 999px; padding: .35rem .62rem; font-size: .68rem; font-weight: 680; white-space: nowrap; }
+.chart-kind { margin: .15rem 0 -.35rem; }
+[class*="st-key-dashboard-charts"] [data-testid="stVerticalBlockBorderWrapper"] { min-height: 452px; overflow: hidden; background: linear-gradient(180deg, rgba(255,255,255,.98), rgba(250,250,252,.92)); }
+[class*="st-key-dashboard-charts"] [data-testid="stPlotlyChart"] { border-radius: 16px; overflow: hidden; }
 .empty-state { min-height: 168px; display: grid; place-content: center; justify-items: center; gap: .65rem; color: var(--muted); background: rgba(255,255,255,.52); border: 1px dashed rgba(29,29,31,.14); border-radius: var(--radius); }
 .empty-state strong { width: 38px; height: 38px; display: grid; place-items: center; border-radius: 12px; color: var(--blue); background: var(--blue-soft); font-size: .82rem; }
 .empty-state span { font-size: .86rem; }
@@ -107,6 +116,8 @@ p, label, [data-testid="stCaptionContainer"] { letter-spacing: 0 !important; }
     .section-meta { text-align: left; }
     [data-testid="stSegmentedControl"] [role="radiogroup"] { overflow-x: auto; }
     .onboarding-hero { margin-top: 1rem; align-items: flex-start; padding: 1.25rem; }
+    .dashboard-hero { align-items: flex-start; flex-direction: column; padding: 1.05rem; }
+    .dashboard-badges { justify-content: flex-start; }
 }
 </style>
 """

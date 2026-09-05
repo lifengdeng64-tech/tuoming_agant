@@ -24,6 +24,7 @@ venv/
 # Local design previews and task scratch data
 .superpowers/
 .tmp-*/
+.tmp_pytest*/
 
 # Windows desktop packaging outputs
 build/

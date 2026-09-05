@@ -5,9 +5,23 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+from pydantic import ValidationError
 
-from tuoming_agent.dashboard.charts import ChartDataError, bar_figure, line_figure
-from tuoming_agent.dashboard.models import AggregationName, infer_dashboard_defaults
+from tuoming_agent.analysis.models import DashboardChartIntent
+from tuoming_agent.dashboard.charts import (
+    ChartDataError,
+    area_figure,
+    bar_figure,
+    line_figure,
+    pie_figure,
+    scatter_figure,
+)
+from tuoming_agent.dashboard.models import (
+    AggregationName,
+    DashboardChartSpec,
+    infer_dashboard_defaults,
+    resolve_dashboard_chart_specs,
+)
 from tuoming_agent.dashboard.service import DashboardQueryError, KPIValue
 from tuoming_agent.models import ArtifactRecord
 from tuoming_agent.storage.errors import RecordNotFoundError
@@ -22,6 +36,13 @@ _AGGREGATION_LABELS = {
     "min": "最小值",
     "max": "最大值",
     "count": "有效值计数",
+}
+_CHART_LABELS = {
+    "line": "折线趋势",
+    "area": "面积趋势",
+    "bar": "分类对比",
+    "pie": "占比构成",
+    "scatter": "关系分布",
 }
 
 
@@ -72,6 +93,9 @@ def prime_dashboard_state(
         if intent.category_column in defaults.category_columns
         else defaults.category_column
     )
+    st.session_state[f"dashboard-plan-{workspace_id}-{artifact.id}"] = [
+        chart.model_dump(mode="json") for chart in getattr(intent, "charts", ())
+    ]
 
 
 def render_dashboard_view(
@@ -105,6 +129,22 @@ def render_dashboard_view(
         st.info("这个数据制品没有可聚合的数值字段，可前往“结果”查看明细。")
         _render_detail(services, tenant_id, workspace_id, artifact)
         return
+
+    st.markdown(
+        """
+        <section class="dashboard-hero">
+            <div>
+                <span>SMART BI · LOCAL ONLY</span>
+                <h3>让问题决定图表，而不是套用固定模板</h3>
+                <p>识别趋势、排名、占比与指标关系；图表数据仍只在本机计算。</p>
+            </div>
+            <div class="dashboard-badges">
+                <b>AI 智能选图</b><b>Plotly 交互</b><b>本地还原名称</b>
+            </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
 
     controls = st.container(border=True)
     with controls:
@@ -145,6 +185,18 @@ def render_dashboard_view(
         _render_detail(services, tenant_id, workspace_id, artifact)
         return
 
+    planned = _stored_chart_intents(
+        st.session_state.get(f"dashboard-plan-{workspace_id}-{artifact.id}", [])
+    )
+    chart_specs = resolve_dashboard_chart_specs(
+        artifact,
+        measures,
+        aggregation,
+        date_column,
+        category_column,
+        planned,
+    )
+
     _render_kpis(
         services,
         tenant_id,
@@ -153,39 +205,23 @@ def render_dashboard_view(
         measures,
         aggregation,
     )
+    st.markdown("### 智能洞察")
+    if planned:
+        st.caption("已按你的分析要求选择图表类型；字段校验与数据计算均在本机完成。")
+    else:
+        st.caption("未指定图表类型，已根据字段角色自动组合趋势、对比与关系图。")
     with st.container(key=f"dashboard-charts-{workspace_id}"):
-        chart_columns = st.columns(2, gap="large")
-        with chart_columns[0]:
-            if date_column is None and category_column is not None and len(measures) > 1:
-                _render_category(
-                    services,
-                    tenant_id,
-                    workspace_id,
-                    artifact,
-                    measures[1],
-                    aggregation,
-                    category_column,
-                )
-            else:
-                _render_trend(
-                    services,
-                    tenant_id,
-                    workspace_id,
-                    artifact,
-                    measures,
-                    aggregation,
-                    date_column,
-                )
-        with chart_columns[1]:
-            _render_category(
-                services,
-                tenant_id,
-                workspace_id,
-                artifact,
-                measures[0],
-                aggregation,
-                category_column,
-            )
+        if not chart_specs:
+            render_empty_state("选择时间或分类字段后生成图表", "图")
+        for start in range(0, len(chart_specs), 2):
+            chart_columns = st.columns(2, gap="large")
+            for column, spec in zip(
+                chart_columns, chart_specs[start : start + 2], strict=False
+            ):
+                with column:
+                    _render_chart_spec(
+                        services, tenant_id, workspace_id, artifact, spec
+                    )
     _render_detail(services, tenant_id, workspace_id, artifact)
 
 
@@ -233,88 +269,123 @@ def _render_kpis(
             )
 
 
-def _render_trend(
+def _render_chart_spec(
     services: ApplicationServices,
     tenant_id: str,
     workspace_id: str,
     artifact: ArtifactRecord,
-    measures: tuple[str, ...],
-    aggregation: AggregationName,
-    date_column: str | None,
+    spec: DashboardChartSpec,
 ) -> None:
     with st.container(border=True):
-        if date_column is None:
-            render_empty_state("选择时间字段后显示趋势", "线")
-            return
+        st.markdown(
+            f'<span class="chart-kind">{_CHART_LABELS[spec.chart_type]}</span>',
+            unsafe_allow_html=True,
+        )
         try:
-            frames = [
-                services.dashboard.grouped(
-                    tenant_id,
-                    workspace_id,
-                    artifact.id,
-                    date_column,
-                    measure,
-                    aggregation,
-                    sort_dimension=True,
+            if spec.chart_type == "scatter":
+                figure = _scatter_for_spec(
+                    services, tenant_id, workspace_id, artifact, spec
                 )
-                for measure in measures
-            ]
-            trend = frames[0]
-            for frame in frames[1:]:
-                trend = trend.merge(frame, on=date_column, how="outer")
-            trend = _restore_display_frame(
-                services, tenant_id, artifact, trend, (date_column,)
+            else:
+                figure = _grouped_figure_for_spec(
+                    services, tenant_id, workspace_id, artifact, spec
+                )
+            st.plotly_chart(
+                figure,
+                width="stretch",
+                config=PLOTLY_CONFIG,
+                key=(
+                    f"chart-{workspace_id}-{artifact.id}-{spec.chart_type}-"
+                    f"{spec.dimension}-{'-'.join(spec.measures)}"
+                ),
             )
-            parsed_dates = _parse_date_dimension(trend[date_column])
-            if parsed_dates.notna().any():
-                trend = trend.loc[parsed_dates.notna()].copy()
-                trend[date_column] = parsed_dates.loc[parsed_dates.notna()]
-            trend = trend.sort_values(date_column, kind="stable").tail(200)
-            figure = line_figure(
-                trend,
-                date_column,
-                measures,
-                title=f"{date_column}趋势",
-            )
-            st.plotly_chart(figure, width="stretch", config=PLOTLY_CONFIG)
         except (DashboardQueryError, ChartDataError, TypeError, ValueError) as exc:
-            st.warning(f"趋势图暂时无法生成：{exc}")
+            st.warning(f"{_CHART_LABELS[spec.chart_type]}暂时无法生成：{exc}")
 
 
-def _render_category(
+def _grouped_figure_for_spec(
     services: ApplicationServices,
     tenant_id: str,
     workspace_id: str,
     artifact: ArtifactRecord,
-    measure: str,
-    aggregation: AggregationName,
-    category_column: str | None,
-) -> None:
-    with st.container(border=True):
-        if category_column is None:
-            render_empty_state("选择分类字段后显示对比", "柱")
-            return
+    spec: DashboardChartSpec,
+):
+    if spec.dimension is None:
+        raise ChartDataError("This chart requires a dimension.")
+    frames = [
+        services.dashboard.grouped(
+            tenant_id,
+            workspace_id,
+            artifact.id,
+            spec.dimension,
+            measure,
+            spec.aggregation,
+            sort_dimension=spec.chart_type in {"line", "area"},
+        )
+        for measure in spec.measures
+    ]
+    grouped = frames[0]
+    for frame in frames[1:]:
+        grouped = grouped.merge(frame, on=spec.dimension, how="outer")
+    grouped = _restore_display_frame(
+        services, tenant_id, artifact, grouped, (spec.dimension,)
+    )
+    if spec.chart_type in {"line", "area"}:
+        parsed_dates = _parse_date_dimension(grouped[spec.dimension])
+        if parsed_dates.notna().any():
+            grouped = grouped.loc[parsed_dates.notna()].copy()
+            grouped[spec.dimension] = parsed_dates.loc[parsed_dates.notna()]
+        grouped = grouped.sort_values(spec.dimension, kind="stable").tail(200)
+        builder = line_figure if spec.chart_type == "line" else area_figure
+        return builder(grouped, spec.dimension, spec.measures, title=spec.title)
+    measure = spec.measures[0]
+    if spec.chart_type == "bar":
+        return bar_figure(
+            grouped.sort_values(measure, kind="stable").tail(15),
+            spec.dimension,
+            measure,
+            title=spec.title,
+        )
+    return pie_figure(grouped, spec.dimension, measure, title=spec.title)
+
+
+def _scatter_for_spec(
+    services: ApplicationServices,
+    tenant_id: str,
+    workspace_id: str,
+    artifact: ArtifactRecord,
+    spec: DashboardChartSpec,
+):
+    columns = (*spec.measures, *((spec.dimension,) if spec.dimension else ()))
+    points = services.dashboard.points(
+        tenant_id,
+        workspace_id,
+        artifact.id,
+        columns,
+    )
+    if spec.dimension:
+        points = _restore_display_frame(
+            services, tenant_id, artifact, points, (spec.dimension,)
+        )
+    return scatter_figure(
+        points,
+        spec.measures[0],
+        spec.measures[1],
+        title=spec.title,
+        label=spec.dimension,
+    )
+
+
+def _stored_chart_intents(values: Any) -> tuple[DashboardChartIntent, ...]:
+    if not isinstance(values, list):
+        return ()
+    intents: list[DashboardChartIntent] = []
+    for value in values[:4]:
         try:
-            grouped = services.dashboard.grouped(
-                tenant_id,
-                workspace_id,
-                artifact.id,
-                category_column,
-                measure,
-                aggregation,
-            )
-            grouped = _restore_display_frame(
-                services, tenant_id, artifact, grouped, (category_column,)
-            )
-            figure = bar_figure(
-                grouped.sort_values(measure, kind="stable").tail(20),
-                category_column,
-                measure,
-                title=f"{category_column}对比 · 前 20 项",
-            )
-            st.plotly_chart(figure, width="stretch", config=PLOTLY_CONFIG)
-        except (DashboardQueryError, ChartDataError, TypeError, ValueError) as exc:
-            st.warning(f"分类图暂时无法生成：{exc}")
+            intents.append(DashboardChartIntent.model_validate(value))
+        except (ValidationError, TypeError):
+            continue
+    return tuple(intents)
 
 
 def _render_detail(

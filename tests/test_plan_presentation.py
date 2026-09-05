@@ -33,6 +33,14 @@ def test_describe_plan_includes_local_dashboard_intent():
             "aggregation": "sum",
             "date_column": "月份",
             "category_column": "事业部",
+            "charts": [
+                {
+                    "chart_type": "pie",
+                    "title": "事业部营收占比",
+                    "dimension": "事业部",
+                    "measures": ["营收"],
+                }
+            ],
         },
     )
 
@@ -41,6 +49,7 @@ def test_describe_plan_includes_local_dashboard_intent():
     assert "本地生成 BI 仪表盘" in rendered
     assert "“营收”" in rendered
     assert "“事业部”" in rendered
+    assert "饼图“事业部营收占比”" in rendered
 
 
 def test_describe_plan_translates_safe_calculations_and_aggregation_to_chinese():

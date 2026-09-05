@@ -31,6 +31,14 @@ AGGREGATIONS = {
     "last": "末个值",
 }
 
+CHART_TYPES = {
+    "line": "折线图",
+    "area": "面积图",
+    "bar": "柱状图",
+    "pie": "饼图",
+    "scatter": "散点图",
+}
+
 _BINARY_OPERATORS: dict[type[ast.operator], tuple[str, int]] = {
     ast.Add: ("＋", 1),
     ast.Sub: ("−", 1),
@@ -204,4 +212,13 @@ def describe_plan(
             f"本地生成 BI 仪表盘：指标 {measures}，"
             f"聚合方式：{AGGREGATIONS[plan.dashboard.aggregation]}{suffix}"
         )
+        if plan.dashboard.charts:
+            chart_descriptions = "、".join(
+                f"{CHART_TYPES[chart.chart_type]}"
+                f"“{_name(chart.title, resolve_value)}”"
+                if chart.title
+                else CHART_TYPES[chart.chart_type]
+                for chart in plan.dashboard.charts
+            )
+            lines.append(f"图表安排：{chart_descriptions}")
     return lines

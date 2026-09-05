@@ -111,6 +111,29 @@ Operation = Annotated[
 ]
 
 
+DashboardChartType = Literal["line", "area", "bar", "pie", "scatter"]
+
+
+class DashboardChartIntent(StrictModel):
+    """A declarative chart request; data access and rendering remain local."""
+
+    chart_type: DashboardChartType
+    title: str | None = Field(default=None, max_length=80)
+    dimension: str | None = None
+    measures: list[str] = Field(min_length=1, max_length=4)
+    aggregation: Literal["sum", "mean", "min", "max", "count"] = "sum"
+
+    @model_validator(mode="after")
+    def require_chart_shape(self) -> DashboardChartIntent:
+        if self.chart_type in {"line", "area", "bar", "pie"} and not self.dimension:
+            raise ValueError(f"{self.chart_type} charts require a dimension.")
+        if self.chart_type == "pie" and len(self.measures) != 1:
+            raise ValueError("Pie charts require exactly one measure.")
+        if self.chart_type == "scatter" and len(self.measures) != 2:
+            raise ValueError("Scatter charts require exactly two measures.")
+        return self
+
+
 class DashboardIntent(StrictModel):
     """A bounded BI view that is rendered locally after an approved plan completes."""
 
@@ -118,6 +141,7 @@ class DashboardIntent(StrictModel):
     aggregation: Literal["sum", "mean", "min", "max", "count"] = "sum"
     date_column: str | None = None
     category_column: str | None = None
+    charts: list[DashboardChartIntent] = Field(default_factory=list, max_length=4)
 
 
 class AnalysisPlan(StrictModel):

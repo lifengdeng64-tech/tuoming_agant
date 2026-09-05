@@ -123,6 +123,36 @@ def test_grouped_results_are_sorted_and_bounded_to_200_points(services, workspac
     assert result.iloc[0].to_dict() == {"division": "division-249", "revenue": 249.0}
 
 
+def test_scatter_points_are_column_allowlisted_and_bounded(services, workspace) -> None:
+    artifact = _store_artifact(
+        services,
+        workspace,
+        pd.DataFrame(
+            {
+                "revenue": list(range(250)),
+                "nights": list(range(250, 500)),
+                "division": [f"division-{index % 5}" for index in range(250)],
+            }
+        ),
+        "artifact-points",
+    )
+
+    result = services.dashboard.points(
+        TENANT,
+        workspace.id,
+        artifact.id,
+        ("revenue", "nights", "division"),
+    )
+
+    assert len(result) == 200
+    assert list(result.columns) == ["revenue", "nights", "division"]
+
+    with pytest.raises(DashboardQueryError, match="column"):
+        services.dashboard.points(
+            TENANT, workspace.id, artifact.id, ("revenue", "forged")
+        )
+
+
 def test_detail_is_masked_and_bounded_to_100_rows(services, workspace) -> None:
     artifact = _store_artifact(
         services,

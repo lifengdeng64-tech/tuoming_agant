@@ -13,6 +13,7 @@ from tuoming_agent.analysis.models import (
     AnalysisPlan,
     GroupByOperation,
     HeadOperation,
+    SelectOperation,
     SortOperation,
 )
 from tuoming_agent.config import AppConfig
@@ -159,6 +160,42 @@ class DashboardService:
         return self.artifact_service.preview(
             tenant_id, artifact.id, limit=bounded_limit, restored=False
         )
+
+    def points(
+        self,
+        tenant_id: str,
+        workspace_id: str,
+        artifact_id: str,
+        columns: tuple[str, ...],
+    ) -> pd.DataFrame:
+        """Read only the allowlisted columns and first 200 local rows for a scatter plot."""
+        if not 2 <= len(columns) <= 3 or len(set(columns)) != len(columns):
+            raise DashboardQueryError(
+                "Dashboard point queries require two or three distinct columns."
+            )
+        artifact = self._artifact(tenant_id, workspace_id, artifact_id)
+        self._require_columns(artifact, columns)
+        plan = AnalysisPlan(
+            input_artifact_id=artifact.id,
+            operations=[
+                SelectOperation(action="select", columns=list(columns)),
+                HeadOperation(action="head", rows=_MAX_CHART_POINTS),
+            ],
+            result_name="Dashboard query",
+            safe_summary="Bounded local dashboard point selection",
+        )
+        runtime = DuckDBRuntime(self.config)
+        try:
+            compiled = runtime.compiler(self.repository).compile(
+                tenant_id, workspace_id, plan
+            )
+            with runtime.connection(compiled.sources) as connection:
+                result = connection.execute(compiled.sql, compiled.parameters).fetch_df()
+        except Exception as exc:
+            raise DashboardQueryError("The bounded local dashboard query failed.") from exc
+        if len(result) > _MAX_CHART_POINTS:
+            raise DashboardQueryError("Dashboard chart data exceeded the 200 point limit.")
+        return result.loc[:, list(columns)]
 
     def _artifact(
         self, tenant_id: str, workspace_id: str, artifact_id: str

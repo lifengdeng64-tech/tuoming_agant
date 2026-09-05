@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from tuoming_agent.analysis.errors import (
     AnalysisPlanValidationError,
     AnalysisProviderError,
 )
-from tuoming_agent.analysis.models import AnalysisPlan
+from tuoming_agent.analysis.models import AnalysisPlan, DashboardChartIntent
 from tuoming_agent.analysis.naming import (
     GeneratedNameValidationError,
     generated_name_issues,
@@ -323,3 +324,42 @@ def test_planner_prompt_defines_weighted_completion_recipe() -> None:
     assert 'operator "ne" and value “临时停业”' in PLANNER_SYSTEM_PROMPT
     assert "summed actual / summed target" in PLANNER_SYSTEM_PROMPT
     assert "current completion / prior completion - 1" in PLANNER_SYSTEM_PROMPT
+
+
+def test_dashboard_intent_accepts_safe_model_selected_chart_specs() -> None:
+    plan = AnalysisPlan(
+        input_artifact_id="artifact-id",
+        operations=[],
+        dashboard={
+            "measures": ["营收", "间夜量"],
+            "category_column": "事业部",
+            "charts": [
+                {
+                    "chart_type": "pie",
+                    "title": "事业部营收占比",
+                    "dimension": "事业部",
+                    "measures": ["营收"],
+                },
+                {
+                    "chart_type": "scatter",
+                    "title": "营收与间夜量关系",
+                    "measures": ["营收", "间夜量"],
+                },
+            ],
+        },
+    )
+
+    assert [chart.chart_type for chart in plan.dashboard.charts] == ["pie", "scatter"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"chart_type": "pie", "dimension": "事业部", "measures": ["营收", "预算"]},
+        {"chart_type": "scatter", "measures": ["营收"]},
+        {"chart_type": "line", "dimension": None, "measures": ["营收"]},
+    ],
+)
+def test_dashboard_chart_intent_rejects_ambiguous_shapes(payload) -> None:
+    with pytest.raises(ValidationError):
+        DashboardChartIntent.model_validate(payload)

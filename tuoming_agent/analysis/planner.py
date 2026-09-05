@@ -26,8 +26,18 @@ deduplicate, merge, groupby, derive, head, tail.
 When the user asks for a chart, dashboard, BI board, trend, comparison, or KPI, populate
 the optional dashboard object. Dashboard measures must contain one to four exact numeric
 output column names; aggregation is sum, mean, min, max, or count; date_column and
-category_column must be exact output column names or null. All charts and aggregations
-will be rendered locally; never send rows or chart data to the model.
+category_column must be exact output column names or null. Use dashboard.charts to preserve
+the user's visualization intent, with at most four declarative chart specifications:
+- line for trends, time series, or requests for a line chart;
+- area for accumulated magnitude over time or an explicit area-chart request;
+- bar for rankings, Top N, and comparisons;
+- pie for share, proportion, composition, or an explicit pie/donut request;
+- scatter for relationship or correlation between exactly two numeric measures.
+Line, area, bar, and pie charts require one exact dimension column. Pie charts require
+exactly one measure. Scatter charts require exactly two measures and may include an optional
+label dimension. If the user explicitly names a supported chart type, keep that type.
+Use concise Chinese chart titles that do not contain personal data. All charts and
+aggregations will be rendered locally; never send rows or chart data to the model.
 If the user only asks for a dashboard and no data transformation is needed, operations may
 be empty. Otherwise, express all cleaning and analysis as ordered allowlisted operations.
 Artifact data is already pseudonymized. Use exact artifact IDs and exact schema column names.
@@ -155,6 +165,10 @@ class SafeAnalysisPlanner:
 
 def _model_generated_values(plan: AnalysisPlan) -> list[Any]:
     values: list[Any] = [plan.safe_summary, *generated_names(plan)]
+    if plan.dashboard is not None:
+        values.extend(
+            chart.title for chart in plan.dashboard.charts if chart.title is not None
+        )
     for operation in plan.operations:
         if isinstance(operation, FilterOperation):
             values.append(operation.value)
